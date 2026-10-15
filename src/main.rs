@@ -310,10 +310,7 @@ struct UsageTray {
 impl UsageTray {
     fn refresh(&mut self) {
         self.count = count_today(&self.path);
-        self.last_hour = match count_last_hour(&self.path) {
-            Some(n) => Some(n),
-            None => Some(0),
-        };
+        self.last_hour = count_last_hour(&self.path);
         self.running = opencode_running(); // <- new
     }
     fn level(&self) -> Level {
@@ -326,8 +323,8 @@ impl UsageTray {
     fn summary(&self) -> String {
         let base = match self.count {
             Some(n) => format!(
-                "{n} requests today\n{:?} requests last hour\nresets at {}",
-                self.last_hour.unwrap(),
+                "{n} requests today\n{} requests last hour\nresets at {}",
+                self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string()),
                 reset_local_time()
             ),
             None => "usage unavailable (database unreadable)".to_string(),
@@ -370,7 +367,10 @@ impl Tray for UsageTray {
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
             title: match self.count {
-                Some(n) => format!("OpenCode Zen Free Tier Usage\n{n} requests today\n{:?} requests last hour", self.last_hour.unwrap()),
+                Some(n) => format!(
+                    "OpenCode Zen Free Tier Usage\n{n} requests today\n{} requests last hour",
+                    self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string())
+                ),
                 None => "Usage unavailable".to_string(),
             },
             description: format!("Resets at {}", reset_local_time()),
@@ -446,10 +446,12 @@ async fn main() {
     loop {
         tick.tick().await;
         let count = count_today(&path);
+        let last_hour = count_last_hour(&path);
         let running = opencode_running(); // <- new
         handle
             .update(|tray: &mut UsageTray| {
                 tray.count = count;
+                tray.last_hour = last_hour;
                 tray.running = running; // <- new
             })
             .await;
