@@ -2,6 +2,11 @@
 name = "opencode-usage-tracker"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "KDE Plasma tray icon that tracks OpenCode Zen free-tier usage"
+repository = "https://github.com/mudhairless/opencode-usage-tracker"
+homepage = "https://github.com/mudhairless/opencode-usage-tracker"
+documentation = "https://github.com/mudhairless/opencode-usage-tracker"
 
 [dependencies]
 anyhow = "1"
