@@ -1,5 +1,7 @@
 # opencode-usage-tracker
 
+[![Rust](https://github.com/mudhairless/opencode-usage-tracker/actions/workflows/rust.yml/badge.svg)](https://github.com/mudhairless/opencode-usage-tracker/actions/workflows/rust.yml)
+
 A KDE Plasma tray icon that shows how many OpenCode Zen free-tier requests you have made today. It reads OpenCode's local SQLite database every 30 seconds and colors the icon to match:
 
 | Icon color | Requests today |
@@ -23,6 +25,8 @@ The tracker runs no INSERT, UPDATE, or DELETE statements, and it makes no networ
 ## Build
 
 ```sh
+git clone https://github.com/mudhairless/opencode-usage-tracker.git
+cd opencode-usage-tracker
 cargo build --release
 ```
 
@@ -123,7 +127,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-`cargo test` covers the installer, the desktop-entry rendering, and the tooltip text.
+`cargo test` covers the installer, the desktop-entry rendering, and the tooltip text. CI runs `cargo build` and `cargo test` on every push and pull request to `main`.
 
 Repository layout:
 
