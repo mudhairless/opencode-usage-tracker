@@ -330,11 +330,7 @@ impl UsageTray {
         self.running = opencode_running(); // <- new
     }
     fn level(&self) -> Level {
-    	if self.running {
         	level_for(self.count)
-        } else {
-  			level_for(Some(0))
-        }
     }
     /// The hover text: title lines plus the reset time. Shared with `--once`
     /// so the CLI and the tray can't drift apart.
