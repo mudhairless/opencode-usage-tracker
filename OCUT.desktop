@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenCode Usage Tracker
+Comment=OpenCode Zen free-tier usage monitor in the system tray
+Exec=@EXEC@
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;
+Keywords=opencode;zen;usage;quota;tray;monitor;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

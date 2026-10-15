@@ -14,10 +14,20 @@
 //! `compaction` rows, which are real summarization calls) whose model is a
 //! free Zen model on provider "opencode"; assistant rows that never finished
 //! are skipped.
+//!
+//! Usage:
+//!   opencode-usage-tracker                    run the tray
+//!   opencode-usage-tracker --once             print the tray's hover text and exit
+//!   opencode-usage-tracker install            install for you (user paths)
+//!   opencode-usage-tracker install --system --autostart
+//!   opencode-usage-tracker uninstall          remove the install
+
+mod install;
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use clap::{Parser, Subcommand};
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Category, Icon, Status, ToolTip, Tray, TrayMethods};
 use rusqlite::{Connection, OpenFlags};
@@ -300,6 +310,12 @@ fn make_icon(level: Level) -> Icon {
 // Tray
 // ---------------------------------------------------------------------------
 
+/// What hovering the tray shows — `--once` prints exactly this.
+struct Hover {
+    title: String,
+    description: String,
+}
+
 struct UsageTray {
     path: PathBuf,
     count: Option<u32>,
@@ -320,6 +336,26 @@ impl UsageTray {
   			level_for(Some(0))
         }
     }
+    /// The hover text: title lines plus the reset time. Shared with `--once`
+    /// so the CLI and the tray can't drift apart.
+    fn hover(&self) -> Hover {
+        let mut title = "OpenCode Zen Free Tier Usage".to_string();
+        if !self.running {
+            title.push_str("\nOpenCode not running");
+        }
+        match self.count {
+            Some(n) => title.push_str(&format!(
+                "\n{n} requests today\n{} requests last hour",
+                self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string())
+            )),
+            None => title.push_str("\nusage unavailable (database unreadable)"),
+        }
+        Hover {
+            title,
+            description: format!("Resets at {}", reset_local_time()),
+        }
+    }
+
     fn summary(&self) -> String {
         let base = match self.count {
             Some(n) => format!(
@@ -363,17 +399,12 @@ impl Tray for UsageTray {
         vec![make_icon(self.level())]
     }
     fn tool_tip(&self) -> ToolTip {
+        let hover = self.hover();
         ToolTip {
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
-            title: match self.count {
-                Some(n) => format!(
-                    "OpenCode Zen Free Tier Usage\n{n} requests today\n{} requests last hour",
-                    self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string())
-                ),
-                None => "Usage unavailable".to_string(),
-            },
-            description: format!("Resets at {}", reset_local_time()),
+            title: hover.title,
+            description: hover.description,
         }
     }
 
@@ -406,22 +437,91 @@ impl Tray for UsageTray {
 }
 
 // ---------------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "KDE tray traffic light for OpenCode Zen free-tier usage",
+    after_help = "examples:\n  opencode-usage-tracker                      run the tray\n  opencode-usage-tracker --once               print the hover text and exit\n  opencode-usage-tracker install              install for you\n  opencode-usage-tracker install --system --autostart\n  opencode-usage-tracker uninstall            remove the install"
+)]
+struct Cli {
+    /// Print the tray's hover text once and exit
+    #[arg(long)]
+    once: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Copy this executable and its .desktop entry into place
+    Install {
+        /// Install system-wide: /usr/local/bin + /usr/share/applications
+        #[arg(long)]
+        system: bool,
+
+        /// Also start the tray at login — written to the invoking user's own
+        /// autostart dir (yours, even under sudo), never the global one
+        #[arg(long)]
+        autostart: bool,
+
+        /// Install this file instead of the running executable
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+
+    /// Remove everything `install` created
+    Uninstall {
+        /// Remove a system-wide install (needs root)
+        #[arg(long)]
+        system: bool,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Main: register the tray, then poll every 30s.
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
+    if let Some(cmd) = &cli.command {
+        let outcome = match cmd {
+            Command::Install {
+                system,
+                autostart,
+                from,
+            } => install::install(*system, *autostart, from.as_deref()),
+            Command::Uninstall { system } => install::uninstall(*system),
+        };
+        if let Err(e) = outcome {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let path = db_path();
 
-    // One-shot mode: print today's count and exit. Handy for testing the
-    // counting logic without a tray, or from scripts.
-    if std::env::args().any(|a| a == "--once") {
-        match count_today(&path) {
-            Some(n) => println!("{n}"),
-            None => {
-                eprintln!("could not read {}", path.display());
-                std::process::exit(1);
-            }
+    // One-shot mode: print the hover text (the same lines the tray shows) and
+    // exit. Handy for testing the counting logic without a tray, or in scripts.
+    if cli.once {
+        let mut snapshot = UsageTray {
+            path: path.clone(),
+            count: None,
+            last_hour: None,
+            running: false,
+        };
+        snapshot.refresh();
+        let hover = snapshot.hover();
+        println!("{}\n{}", hover.title, hover.description);
+        if snapshot.count.is_none() {
+            eprintln!("could not read {}", path.display());
+            std::process::exit(1);
         }
         return;
     }
@@ -455,5 +555,41 @@ async fn main() {
                 tray.running = running; // <- new
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tray(count: Option<u32>, running: bool) -> UsageTray {
+        UsageTray {
+            path: PathBuf::new(),
+            count,
+            last_hour: Some(3),
+            running,
+        }
+    }
+
+    #[test]
+    fn hover_text_matches_the_tray() {
+        let hover = tray(Some(12), true).hover();
+        assert_eq!(
+            hover.title,
+            "OpenCode Zen Free Tier Usage\n12 requests today\n3 requests last hour"
+        );
+        assert!(hover.description.starts_with("Resets at "));
+    }
+
+    #[test]
+    fn hover_notes_a_stopped_opencode() {
+        let hover = tray(Some(0), false).hover();
+        assert!(hover.title.contains("OpenCode not running"));
+    }
+
+    #[test]
+    fn hover_reports_an_unreadable_database() {
+        let hover = tray(None, true).hover();
+        assert!(hover.title.contains("usage unavailable (database unreadable)"));
     }
 }
