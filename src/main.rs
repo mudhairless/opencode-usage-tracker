@@ -96,34 +96,41 @@ fn opencode_running() -> bool {
     false
 }
 
-/// Is the newest session mid-run? OpenCode stamps `time_idle` on session_v2
-/// when a run finishes (a few ms after `time_updated`, with the outcome);
-/// activity newer than that stamp — or a first run that has a user prompt
-/// but no stamp yet — means work is in flight. One-row lookup, cheap enough
-/// to poll every second. `false` when the DB can't be read.
+/// Is the newest session mid-run?
+///
+/// OpenCode appends a row to `session_message` as a run progresses: the `user`
+/// prompt, then one or more `assistant` messages (each stamped with
+/// `time.completed` once its step ends), and finally an `idle` message when
+/// the run finishes. So a run is in flight exactly while the newest assistant
+/// message has no `time.completed` yet.
+///
+/// This deliberately does not use `session_v2.time_updated` vs `time_idle`:
+/// several OpenCode projectors (title generation, usage roll-ups, metadata)
+/// bump `time_updated` *after* the terminal `time_idle` stamp, so
+/// `time_updated > time_idle` latches true and would spin the icon forever.
+///
+/// One-row lookup, cheap enough to poll every second. `false` when the DB
+/// can't be read or the session has no assistant message yet.
 fn session_working(path: &PathBuf) -> bool {
     let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) else {
         return false;
     };
     let _ = conn.busy_timeout(Duration::from_millis(250));
+    working_from(&conn)
+}
+
+fn working_from(conn: &Connection) -> bool {
     conn.query_row(
-        "SELECT s.time_updated, s.time_idle,
-                EXISTS(SELECT 1 FROM session_message m
-                       WHERE m.session_id = s.id AND m.type = 'user')
-         FROM session_v2 s ORDER BY s.time_updated DESC LIMIT 1",
+        "SELECT json_extract(m.data, '$.time.completed')
+           FROM session_v2 s
+           JOIN session_message m
+             ON m.session_id = s.id
+            AND m.seq = (SELECT MAX(m2.seq) FROM session_message m2
+                          WHERE m2.session_id = s.id AND m2.type = 'assistant')
+          WHERE s.id = (SELECT id FROM session_v2 ORDER BY time_updated DESC LIMIT 1)",
         [],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        },
+        |row| Ok(row.get::<_, Option<i64>>(0)?.is_none()),
     )
-    .map(|(updated, idle, has_prompt)| match idle {
-        None => has_prompt,          // first run: working only once a prompt exists
-        Some(stamp) => updated > stamp,
-    })
     .unwrap_or(false)
 }
 
@@ -381,7 +388,10 @@ impl UsageTray {
         self.count = count_today(&self.path);
         self.last_hour = count_last_hour(&self.path);
         self.running = opencode_running(); // <- new
-        self.working = session_working(&self.path);
+        // A run can't be in flight if OpenCode isn't running. Gating here also
+        // covers a session OpenCode left unfinished (killed mid-run) instead
+        // of spinning forever.
+        self.working = self.running && session_working(&self.path);
     }
     fn level(&self) -> Level {
         	level_for(self.count)
@@ -438,7 +448,9 @@ impl Tray for UsageTray {
         // Active = shown in the tray; Passive = Plasma tucks the item into
         // the hidden/inactive area. ksni emits the NewStatus signal when
         // this changes during handle.update(), so the item moves itself.
-        if self.running {
+        // While working we must stay Active even if OpenCode has just closed,
+        // otherwise Plasma stops repainting and the spin animation freezes.
+        if self.running || self.working {
             Status::Active
         } else {
             Status::Passive
@@ -608,7 +620,9 @@ async fn main() {
     
         let was_working = working;
         if ticks.is_multiple_of(4) {
-            working = session_working(&path); // 1s cadence
+            // 1s cadence. The /proc scan is cheap, and gating on it clears
+            // `working` when OpenCode isn't running (e.g. killed mid-run).
+            working = opencode_running() && session_working(&path);
         }
     
         if ticks.is_multiple_of(TICKS_PER_POLL) {
@@ -682,5 +696,51 @@ mod tests {
     fn hover_reports_an_unreadable_database() {
         let hover = tray(None, true).hover();
         assert!(hover.title.contains("usage unavailable (database unreadable)"));
+    }
+
+    /// Build the two tables `working_from` touches and seed one newest session.
+    fn working_db(last_assistant_completed: Option<i64>) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+             CREATE TABLE session_message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 data TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, time_updated) VALUES ('ses_a', 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, data)
+             VALUES ('m1', 'ses_a', 'user', 1, '{\"time\":{\"created\":1}}')",
+            [],
+        )
+        .unwrap();
+        let completed = last_assistant_completed
+            .map(|t| format!(",\"completed\":{t}"))
+            .unwrap_or_default();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, data)
+             VALUES ('m2', 'ses_a', 'assistant', 2, ?1)",
+            [format!("{{\"time\":{{\"created\":2{completed}}}}}")],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn working_while_the_newest_assistant_step_is_unfinished() {
+        assert!(working_from(&working_db(None)));
+    }
+
+    #[test]
+    fn idle_once_the_assistant_step_completes() {
+        assert!(!working_from(&working_db(Some(3))));
     }
 }
