@@ -32,10 +32,14 @@ use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Category, Icon, Status, ToolTip, Tray, TrayMethods};
 use rusqlite::{Connection, OpenFlags};
 
-const POLL: Duration = Duration::from_secs(30);
+const SPIN_TICK: Duration = Duration::from_millis(250);
+const TICKS_PER_POLL: u64 = 120;
+const SPIN_FRAMES: u8 = 8;
+const ARC: f32 = 2.1; // radians of ring lit behind the head (~120°)
 const YELLOW_AT: u32 = 400;
 const RED_AT: u32 = 500;
-const ICON_SIZE: i32 = 22;
+const ICON_SIZE: i32 = 44;
+const THROBBER_THICKNESS: f32 = 2.4;
 const AN_HOUR_IN_MS: i64 = 3_600_000;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +95,38 @@ fn opencode_running() -> bool {
     }
     false
 }
+
+/// Is the newest session mid-run? OpenCode stamps `time_idle` on session_v2
+/// when a run finishes (a few ms after `time_updated`, with the outcome);
+/// activity newer than that stamp — or a first run that has a user prompt
+/// but no stamp yet — means work is in flight. One-row lookup, cheap enough
+/// to poll every second. `false` when the DB can't be read.
+fn session_working(path: &PathBuf) -> bool {
+    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(250));
+    conn.query_row(
+        "SELECT s.time_updated, s.time_idle,
+                EXISTS(SELECT 1 FROM session_message m
+                       WHERE m.session_id = s.id AND m.type = 'user')
+         FROM session_v2 s ORDER BY s.time_updated DESC LIMIT 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        },
+    )
+    .map(|(updated, idle, has_prompt)| match idle {
+        None => has_prompt,          // first run: working only once a prompt exists
+        Some(stamp) => updated > stamp,
+    })
+    .unwrap_or(false)
+}
+
 
 /// The Zen limiter's day is the UTC day; the Unix epoch starts at a UTC
 /// midnight, so the current day's start is a simple floor division.
@@ -261,7 +297,7 @@ fn level_for(count: Option<u32>) -> Level {
     }
 }
 
-fn make_icon(level: Level) -> Icon {
+fn make_icon(level: Level, spin: Option<u8>) -> Icon {
     let (r, g, b) = match level {
         Level::Green => (46u8, 204u8, 113u8),
         Level::Yellow => (241, 196, 15),
@@ -270,7 +306,7 @@ fn make_icon(level: Level) -> Icon {
     };
     let size = ICON_SIZE;
     let c = (size as f32 - 1.0) / 2.0;
-    let radius = c - 0.5;
+    let radius = if spin.is_some() { c - 3.5 } else { c - 0.5 };
     let mut data = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
@@ -285,6 +321,21 @@ fn make_icon(level: Level) -> Icon {
             } else {
                 ((radius + 0.5 - dist) * 255.0) as u8
             };
+            if let Some(frame) = spin {
+                let ring_r = c - 1.25;
+                if (dist - ring_r).abs() <= THROBBER_THICKNESS {
+                    let phi = (-dy).atan2(dx);
+                    let phi = if phi < 0.0 { phi + std::f32::consts::TAU } else { phi };
+                    let head = (frame as f32 / SPIN_FRAMES as f32) * std::f32::consts::TAU;
+                    let behind = (head - phi).rem_euclid(std::f32::consts::TAU);
+                    if behind < ARC {
+                        let fade = 1.0 - behind / ARC;
+                        data.extend_from_slice(&[(fade * 255.0) as u8, 255, 255, 255]);
+                        continue;
+                    }
+                }
+            }
+            
             // gentle top-down shading so it reads as a little lamp
             let shade = if dist <= radius {
                 1.0 - (dy / (radius * 2.0) + 0.5) * 0.25
@@ -321,6 +372,8 @@ struct UsageTray {
     count: Option<u32>,
     last_hour: Option<u32>,
     running: bool,
+    working: bool,
+    frame: u8,
 }
 
 impl UsageTray {
@@ -328,6 +381,7 @@ impl UsageTray {
         self.count = count_today(&self.path);
         self.last_hour = count_last_hour(&self.path);
         self.running = opencode_running(); // <- new
+        self.working = session_working(&self.path);
     }
     fn level(&self) -> Level {
         	level_for(self.count)
@@ -392,8 +446,10 @@ impl Tray for UsageTray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        vec![make_icon(self.level())]
+        let spin = if self.working { Some(self.frame) } else { None };
+        vec![make_icon(self.level(), spin)]
     }
+    
     fn tool_tip(&self) -> ToolTip {
         let hover = self.hover();
         ToolTip {
@@ -511,6 +567,8 @@ async fn main() {
             count: None,
             last_hour: None,
             running: false,
+            working: false,
+            frame: 0,
         };
         snapshot.refresh();
         let hover = snapshot.hover();
@@ -527,9 +585,11 @@ async fn main() {
         count: None,
         last_hour: None,
         running: false,
+        working: false,
+        frame: 0,
     };
     tray.refresh(); // first paint should already be right
-
+	let mut working = tray.working;
     let handle = match tray.spawn().await {
         Ok(h) => h,
         Err(e) => {
@@ -538,20 +598,53 @@ async fn main() {
         }
     };
 
-    let mut tick = tokio::time::interval(POLL);
+    let mut beat = tokio::time::interval(SPIN_TICK);
+    let mut ticks: u64 = 0;
+    
+    let mut frame: u8 = 0;
     loop {
-        tick.tick().await;
-        let count = count_today(&path);
-        let last_hour = count_last_hour(&path);
-        let running = opencode_running(); // <- new
-        handle
-            .update(|tray: &mut UsageTray| {
-                tray.count = count;
-                tray.last_hour = last_hour;
-                tray.running = running; // <- new
-            })
-            .await;
+        beat.tick().await;
+        ticks = ticks.wrapping_add(1);
+    
+        let was_working = working;
+        if ticks.is_multiple_of(4) {
+            working = session_working(&path); // 1s cadence
+        }
+    
+        if ticks.is_multiple_of(TICKS_PER_POLL) {
+            // your existing full poll, unchanged apart from also storing working
+            let count = count_today(&path);
+            let last_hour = count_last_hour(&path);
+            let running = opencode_running();
+            let w = working;
+            handle
+                .update(|tray: &mut UsageTray| {
+                    tray.count = count;
+                    tray.last_hour = last_hour;
+                    tray.running = running;
+                    tray.working = w;
+                })
+                .await;
+            continue;
+        }
+    
+        if working {
+            frame = (frame + 1) % SPIN_FRAMES;
+            let f = frame;
+            handle
+                .update(|tray: &mut UsageTray| {
+                    tray.working = true;
+                    tray.frame = f;
+                })
+                .await;
+        } else if was_working {
+            // one final update so the ring freezes back to the plain disc
+            handle
+                .update(|tray: &mut UsageTray| tray.working = false)
+                .await;
+        }
     }
+    
 }
 
 #[cfg(test)]
@@ -564,6 +657,8 @@ mod tests {
             count,
             last_hour: Some(3),
             running,
+            working: false,
+            frame: 0
         }
     }
 
