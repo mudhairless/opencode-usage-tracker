@@ -23,6 +23,7 @@
 //!   opencode-usage-tracker uninstall          remove the install
 
 mod install;
+mod stats;
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -135,6 +136,13 @@ fn working_from(conn: &Connection) -> bool {
 }
 
 
+fn now_ms() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+}
+
 /// The Zen limiter's day is the UTC day; the Unix epoch starts at a UTC
 /// midnight, so the current day's start is a simple floor division.
 fn utc_day_start_ms(now_ms: i64) -> i64 {
@@ -166,34 +174,38 @@ fn is_free_model(id: &str) -> bool {
     id == "big-pickle" || id.ends_with("-free")
 }
 
-/// Count today's completed free Zen requests. Returns `None` when the
-/// database can't be read (missing, locked solid, schema changed) so the
-/// tray can show "unknown" instead of a misleading zero.
-fn count_today(path: &PathBuf) -> Option<u32> {
-    // Read-write (not read-only) so a pending WAL is replayed, exactly like
-    // the JS loader. We only ever SELECT.
+/// Open OpenCode's database read-write (not read-only) so a pending WAL is
+/// replayed, exactly like the JS loader. We only ever SELECT.
+fn open_db(path: &PathBuf) -> Option<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
     let _ = conn.busy_timeout(Duration::from_secs(2));
+    Some(conn)
+}
 
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis() as i64;
-    let start = utc_day_start_ms(now_ms);
-
+/// Every completed free Zen message created in `[start_ms, end_ms)`, as
+/// (message type, parsed data). Same free-model rule the JS tracker's catalog
+/// reduces to: Big Pickle plus every model whose id carries the `-free`
+/// suffix. Assistant rows that never finished (still streaming / aborted) are
+/// skipped; compaction rows carry a status instead and count as-is.
+fn free_rows_between(
+    conn: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+) -> Option<Vec<(String, serde_json::Value)>> {
     let mut stmt = conn
         .prepare(
             "SELECT type, data FROM session_message \
-             WHERE type IN ('assistant', 'compaction') AND time_created >= ?1",
+             WHERE type IN ('assistant', 'compaction') \
+             AND time_created >= ?1 AND time_created < ?2",
         )
         .ok()?;
     let rows = stmt
-        .query_map([start], |r| {
+        .query_map([start_ms, end_ms], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
         .ok()?;
 
-    let mut count = 0u32;
+    let mut out = Vec::new();
     for row in rows {
         let Ok((msg_type, data)) = row else { continue };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
@@ -203,83 +215,90 @@ fn count_today(path: &PathBuf) -> Option<u32> {
         let provider = model
             .and_then(|m| m.get("providerID"))
             .and_then(|p| p.as_str());
-        let id = model.and_then(|m| m.get("id")).and_then(|p| p.as_str());
         if provider != Some("opencode") {
             continue;
         }
-        let Some(id) = id else { continue };
+        let Some(id) = model.and_then(|m| m.get("id")).and_then(|p| p.as_str()) else {
+            continue;
+        };
         if !is_free_model(id) {
             continue;
         }
-        // Skip assistant rows that never finished (still streaming / aborted).
-        // Compaction rows carry a status instead, and are counted as-is.
         if msg_type == "assistant"
             && v.pointer("/time/completed").is_none()
             && v.get("finish").is_none()
         {
             continue;
         }
-        count += 1;
+        out.push((msg_type, v));
     }
-    Some(count)
+    Some(out)
+}
+
+/// Every completed free Zen message created at or after `start_ms`: the
+/// open-ended query the tray's "now" counters use (today, last hour).
+fn free_rows_since(conn: &Connection, start_ms: i64) -> Option<Vec<(String, serde_json::Value)>> {
+    free_rows_between(conn, start_ms, i64::MAX)
+}
+
+/// Count today's completed free Zen requests. Returns `None` when the
+/// database can't be read (missing, locked solid, schema changed) so the
+/// tray can show "unknown" instead of a misleading zero.
+fn count_today(path: &PathBuf) -> Option<u32> {
+    let conn = open_db(path)?;
+    let start = utc_day_start_ms(now_ms()?);
+    Some(free_rows_since(&conn, start)?.len() as u32)
 }
 
 /// Count the last hour's completed free Zen requests. Returns `None` when the
 /// database can't be read (missing, locked solid, schema changed) so the
 /// tray can show "unknown" instead of a misleading zero.
 fn count_last_hour(path: &PathBuf) -> Option<u32> {
-    // Read-write (not read-only) so a pending WAL is replayed, exactly like
-    // the JS loader. We only ever SELECT.
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
-    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let conn = open_db(path)?;
+    let start = now_ms()? - AN_HOUR_IN_MS;
+    Some(free_rows_since(&conn, start)?.len() as u32)
+}
 
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis() as i64;
-    let start = now_ms - AN_HOUR_IN_MS;
+/// The five token buckets OpenCode stamps on an assistant message:
+/// `{input, output, reasoning, cache: {read, write}}`. Anything absent or
+/// non-numeric counts as zero.
+fn tokens_in(v: &serde_json::Value) -> u64 {
+    let t = match v.get("tokens") {
+        Some(t) => t,
+        None => return 0,
+    };
+    let bucket = |n: &serde_json::Value, key: &str| {
+        n.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+    };
+    bucket(t, "input")
+        + bucket(t, "output")
+        + bucket(t, "reasoning")
+        + t.get("cache").map_or(0, |c| bucket(c, "read"))
+        + t.get("cache").map_or(0, |c| bucket(c, "write"))
+}
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT type, data FROM session_message \
-             WHERE type IN ('assistant', 'compaction') AND time_created >= ?1",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map([start], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })
-        .ok()?;
+/// How many tokens the free Zen models consumed during the UTC day starting
+/// at `day_start_ms` (the day the Zen limiter gates on). Sums every bucket
+/// OpenCode records, so cached input is included. `None` when the database
+/// can't be read.
+fn tokens_on_day(path: &PathBuf, day_start_ms: i64) -> Option<u64> {
+    let conn = open_db(path)?;
+    let rows = free_rows_since(&conn, day_start_ms)?;
+    Some(rows.iter().map(|(_, v)| tokens_in(v)).sum())
+}
 
-    let mut count = 0u32;
-    for row in rows {
-        let Ok((msg_type, data)) = row else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
-            continue;
-        };
-        let model = v.get("model");
-        let provider = model
-            .and_then(|m| m.get("providerID"))
-            .and_then(|p| p.as_str());
-        let id = model.and_then(|m| m.get("id")).and_then(|p| p.as_str());
-        if provider != Some("opencode") {
-            continue;
-        }
-        let Some(id) = id else { continue };
-        if !is_free_model(id) {
-            continue;
-        }
-        // Skip assistant rows that never finished (still streaming / aborted).
-        // Compaction rows carry a status instead, and are counted as-is.
-        if msg_type == "assistant"
-            && v.pointer("/time/completed").is_none()
-            && v.get("finish").is_none()
-        {
-            continue;
-        }
-        count += 1;
+/// Today's free-model token total, for the current UTC day.
+fn tokens_today(path: &PathBuf) -> Option<u64> {
+    tokens_on_day(path, utc_day_start_ms(now_ms()?))
+}
+
+/// "812", "34.5K", "1.2M" — keeps the hover tooltip to one short line.
+fn format_tokens(n: u64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{:.1}K", n as f64 / 1_000.0),
+        n => n.to_string(),
     }
-    Some(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +397,7 @@ struct UsageTray {
     path: PathBuf,
     count: Option<u32>,
     last_hour: Option<u32>,
+    tokens: Option<u64>,
     running: bool,
     working: bool,
     frame: u8,
@@ -387,6 +407,7 @@ impl UsageTray {
     fn refresh(&mut self) {
         self.count = count_today(&self.path);
         self.last_hour = count_last_hour(&self.path);
+        self.tokens = tokens_today(&self.path);
         self.running = opencode_running(); // <- new
         // A run can't be in flight if OpenCode isn't running. Gating here also
         // covers a session OpenCode left unfinished (killed mid-run) instead
@@ -404,10 +425,16 @@ impl UsageTray {
             title.push_str("\nOpenCode not running");
         }
         match self.count {
-            Some(n) => title.push_str(&format!(
-                "\n{n} requests today\n{} requests last hour",
-                self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string())
-            )),
+            Some(n) => {
+                title.push_str(&format!(
+                    "\n{n} requests today\n{} requests last hour",
+                    self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string())
+                ));
+                match self.tokens {
+                    Some(t) => title.push_str(&format!("\n{} tokens today", format_tokens(t))),
+                    None => title.push_str("\ntokens unavailable"),
+                }
+            }
             None => title.push_str("\nusage unavailable (database unreadable)"),
         }
         Hover {
@@ -418,11 +445,18 @@ impl UsageTray {
 
     fn summary(&self) -> String {
         let base = match self.count {
-            Some(n) => format!(
-                "{n} requests today\n{} requests last hour\nresets at {}",
-                self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string()),
-                reset_local_time()
-            ),
+            Some(n) => {
+                let mut s = format!(
+                    "{n} requests today\n{} requests last hour",
+                    self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string()),
+                );
+                match self.tokens {
+                    Some(t) => s.push_str(&format!("\n{} tokens today", format_tokens(t))),
+                    None => s.push_str("\ntokens unavailable"),
+                }
+                s.push_str(&format!("\nresets at {}", reset_local_time()));
+                s
+            }
             None => "usage unavailable (database unreadable)".to_string(),
         };
 
@@ -543,6 +577,20 @@ enum Command {
         #[arg(long)]
         system: bool,
     },
+
+    /// Show historical free-tier usage per UTC day: a terminal chart, or
+    /// JSON with --json. The chart fits as many days as bars fit on screen;
+    /// the arrow keys slide the window when more days are loaded than fit.
+    Stats {
+        /// How many days back to report (1 or more). Defaults to the most
+        /// days whose bars fit on screen (7 with --json)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=365))]
+        days: Option<u32>,
+
+        /// Print JSON (per-day rows plus totals) instead of the chart
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +609,7 @@ async fn main() {
                 from,
             } => install::install(*system, *autostart, from.as_deref()),
             Command::Uninstall { system } => install::uninstall(*system),
+            Command::Stats { days, json } => stats::run(&db_path(), *days, *json),
         };
         if let Err(e) = outcome {
             eprintln!("error: {e:#}");
@@ -578,6 +627,7 @@ async fn main() {
             path: path.clone(),
             count: None,
             last_hour: None,
+            tokens: None,
             running: false,
             working: false,
             frame: 0,
@@ -596,6 +646,7 @@ async fn main() {
         path: path.clone(),
         count: None,
         last_hour: None,
+        tokens: None,
         running: false,
         working: false,
         frame: 0,
@@ -629,12 +680,14 @@ async fn main() {
             // your existing full poll, unchanged apart from also storing working
             let count = count_today(&path);
             let last_hour = count_last_hour(&path);
+            let tokens = tokens_today(&path);
             let running = opencode_running();
             let w = working;
             handle
                 .update(|tray: &mut UsageTray| {
                     tray.count = count;
                     tray.last_hour = last_hour;
+                    tray.tokens = tokens;
                     tray.running = running;
                     tray.working = w;
                 })
@@ -670,6 +723,7 @@ mod tests {
             path: PathBuf::new(),
             count,
             last_hour: Some(3),
+            tokens: Some(12345),
             running,
             working: false,
             frame: 0
@@ -681,7 +735,7 @@ mod tests {
         let hover = tray(Some(12), true).hover();
         assert_eq!(
             hover.title,
-            "OpenCode Zen Free Tier Usage\n12 requests today\n3 requests last hour"
+            "OpenCode Zen Free Tier Usage\n12 requests today\n3 requests last hour\n12.3K tokens today"
         );
         assert!(hover.description.starts_with("Resets at "));
     }

@@ -15,6 +15,8 @@ The Zen day resets at 00:00 UTC. The tooltip and the tray menu show the reset ti
 
 The tracker runs no INSERT, UPDATE, or DELETE statements, and it makes no network requests. Every number comes from the local OpenCode database.
 
+The `stats` subcommand charts the same counts per UTC day in the terminal.
+
 ## Requirements
 
 - Linux with a system tray that implements StatusNotifierItem. Development targets KDE Plasma.
@@ -87,6 +89,7 @@ sudo ./target/release/opencode-usage-tracker uninstall --system
 | `opencode-usage-tracker` | Run the tray. |
 | `opencode-usage-tracker --once` | Print the tooltip text and exit. |
 | `opencode-usage-tracker install` | Install for the current user. |
+| `opencode-usage-tracker stats` | Chart free-tier usage per UTC day in the terminal. |
 | `opencode-usage-tracker uninstall` | Remove an install for the current user. |
 
 `--once` prints the same lines as the tooltip:
@@ -108,6 +111,31 @@ If the database cannot be read, `--once` prints `usage unavailable (database unr
 - The menu holds a summary line, **Refresh now**, and **Quit**.
 - While OpenCode is not running, the icon is green and Plasma moves the item to the hidden tray area. The tooltip adds an `OpenCode not running` line.
 
+### The stats chart
+
+`stats` buckets the same rows into UTC days, one bar per day. Bars are eight columns wide with a one column gap, so the default day count is whichever whole number of bars fits across the terminal. Each bar prints its count at its base, tokens as `47.21M` and request counts as whole numbers, and a box in the top-right corner names what the bars count.
+
+| Key | Effect |
+| --- | --- |
+| `←` and `→`, or `h` and `l` | Slide the window one day. Works only when more days are loaded than fit on screen. |
+| `Tab` | Switch between tokens and requests. |
+| `b` | Switch between bars and a line. |
+| `q` or `Esc` | Quit. |
+
+### stats options
+
+| Option | Effect |
+| --- | --- |
+| `--days N` | How many days back to report, 1 to 365. Defaults to the most days whose bars fit across the terminal, and to 7 with `--json`. |
+| `--json` | Print the per-day rows and totals as JSON instead of the chart. |
+
+`--json` prints one object holding the days, a UTC timestamp, and the totals:
+
+```
+$ opencode-usage-tracker stats --days 2 --json
+{"days":[{"date":"2026-10-18","requests":525,"tokens":44405942},{"date":"2026-10-19","requests":434,"tokens":24847216}],"generated_at_utc":"2026-10-19T04:40:51Z","totals":{"requests":959,"tokens":69253158}}
+```
+
 ## Counting
 
 The tracker counts rows in `$HOME/.local/share/opencode/opencode.db`, table `session_message`. A row counts when all of these hold:
@@ -127,11 +155,12 @@ cargo test
 cargo clippy --all-targets
 ```
 
-`cargo test` covers the installer, the desktop-entry rendering, and the tooltip text. CI runs `cargo build` and `cargo test` on every push and pull request to `main`.
+`cargo test` covers the installer, the desktop-entry rendering, the tooltip text, and the stats chart (day bucketing and bar layout). CI runs `cargo build` and `cargo test` on every push and pull request to `main`.
 
 Repository layout:
 
 - `src/main.rs` counts requests, draws the icon, and defines the command line.
+- `src/stats.rs` implements `stats`: the per-day query, the JSON output, and the terminal chart.
 - `src/install.rs` installs and uninstalls the executable and the desktop entry.
 - `OCUT.desktop` is the desktop-entry template. `src/install.rs` replaces its `@EXEC@` placeholder with the installed path. The menu entry uses the standard `utilities-system-monitor` icon.
 
