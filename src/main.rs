@@ -6,9 +6,9 @@
 //! and colours the tray icon by the current UTC day — the day the Zen limiter
 //! gates on (it resets at 00:00 UTC):
 //!
-//!   green  < 400 requests
-//!   yellow 400–499
-//!   red    >= 500
+//!   green  < 100 requests
+//!   yellow 100–149
+//!   red    >= 150
 //!
 //! Counting mirrors the JS loader it is based on: `assistant` rows (plus
 //! `compaction` rows, which are real summarization calls) whose model is a
@@ -37,8 +37,8 @@ const SPIN_TICK: Duration = Duration::from_millis(250);
 const TICKS_PER_POLL: u64 = 120;
 const SPIN_FRAMES: u8 = 8;
 const ARC: f32 = 2.1; // radians of ring lit behind the head (~120°)
-const YELLOW_AT: u32 = 400;
-const RED_AT: u32 = 500;
+const YELLOW_AT: u32 = 100;
+const RED_AT: u32 = 150;
 const ICON_SIZE: i32 = 44;
 const THROBBER_THICKNESS: f32 = 2.4;
 const AN_HOUR_IN_MS: i64 = 3_600_000;
