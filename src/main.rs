@@ -22,14 +22,16 @@
 //!   opencode-usage-tracker install --system --autostart
 //!   opencode-usage-tracker uninstall          remove the install
 
+mod config;
+mod dialog;
 mod install;
 mod stats;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use ksni::menu::{MenuItem, StandardItem};
+use ksni::menu::{MenuItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, Status, ToolTip, Tray, TrayMethods};
 use rusqlite::{Connection, OpenFlags};
 
@@ -402,10 +404,22 @@ struct UsageTray {
     running: bool,
     working: bool,
     frame: u8,
+    config: config::Config,
+    config_path: PathBuf,
+    config_mtime: i64,
 }
 
 impl UsageTray {
+    /// Reload the config from disk and restamp the mtime the tray watches.
+    fn reload_config(&mut self) {
+        self.config = config::load_or_default(&self.config_path);
+        self.config_mtime = config::modified_ms(&self.config_path).unwrap_or(0);
+    }
     fn refresh(&mut self) {
+        let mtime = config::modified_ms(&self.config_path).unwrap_or(0);
+        if mtime != self.config_mtime {
+            self.reload_config();
+        }
         self.count = count_today(&self.path);
         self.last_hour = count_last_hour(&self.path);
         self.tokens = tokens_today(&self.path);
@@ -539,7 +553,7 @@ impl Tray for UsageTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
+        let mut items = vec![
             StandardItem {
                 label: self.summary(),
                 enabled: false,
@@ -547,22 +561,229 @@ impl Tray for UsageTray {
             }
             .into(),
             MenuItem::Separator,
+        ];
+
+        // The balance only matters in credit mode.
+        if self.config.plan == config::Plan::Credit {
+            items.push(
+                StandardItem {
+                    label: "Set balance…".to_string(),
+                    activate: Box::new(|tray: &mut Self| {
+                        // Dialogs block on the user, so never do it on the tray thread.
+                        let path = tray.config_path.clone();
+                        std::thread::spawn(move || prompt_set_balance_flow(&path));
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        items.push(
+            SubMenu {
+                label: format!("Plan: {}", plan_label(self.config.plan)),
+                submenu: vec![
+                    config_item("Free — free tier", "plan", "free", self.config_path.clone()),
+                    config_item("Go — subscription", "plan", "go", self.config_path.clone()),
+                    config_item(
+                        "Credit — pay-as-you-go",
+                        "plan",
+                        "credit",
+                        self.config_path.clone(),
+                    ),
+                ],
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        if self.config.plan == config::Plan::Go {
+            items.push(
+                SubMenu {
+                    label: format!("Go tier: {}", tier_label(self.config.go_tier)),
+                    submenu: vec![
+                        config_item("Go", "go.tier", "go", self.config_path.clone()),
+                        config_item("Go Plus", "go.tier", "go_plus", self.config_path.clone()),
+                        config_item("Go Teams", "go.tier", "go_teams", self.config_path.clone()),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        items.push(
+            StandardItem {
+                label: "Open config file".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let path = tray.config_path.clone();
+                    std::thread::spawn(move || open_config_file(&path));
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(MenuItem::Separator);
+        items.push(
             StandardItem {
                 label: "Refresh now".to_string(),
                 activate: Box::new(|tray: &mut Self| tray.refresh()),
                 ..Default::default()
             }
             .into(),
+        );
+        items.push(
             StandardItem {
                 label: "Quit".to_string(),
                 activate: Box::new(|_| std::process::exit(0)),
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        items
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         self.refresh();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Configure actions
+// ---------------------------------------------------------------------------
+
+fn plan_label(plan: config::Plan) -> &'static str {
+    match plan {
+        config::Plan::Free => "Free",
+        config::Plan::Go => "Go",
+        config::Plan::Credit => "Credit",
+    }
+}
+
+fn tier_label(tier: config::GoTier) -> &'static str {
+    match tier {
+        config::GoTier::Go => "Go",
+        config::GoTier::GoPlus => "Go Plus",
+        config::GoTier::GoTeams => "Go Teams",
+    }
+}
+
+/// A menu item that writes one config key, then reloads the tray's own copy
+/// so labels and plan-dependent items reflect the write immediately.
+fn config_item(
+    label: &str,
+    key: &'static str,
+    value: &'static str,
+    path: PathBuf,
+) -> MenuItem<UsageTray> {
+    StandardItem {
+        label: label.to_string(),
+        activate: Box::new(move |tray: &mut UsageTray| {
+            let _ = config::set_value(&path, key, value);
+            tray.reload_config();
+        }),
+        ..Default::default()
+    }
+    .into()
+}
+
+/// Ask for a new balance and save it. Shared with the notification button a
+/// later phase will add; always run this off the tray thread.
+fn prompt_set_balance_flow(path: &Path) {
+    let dialogs = dialog::Dialogs::new();
+    if !dialogs.available() {
+        open_config_file(path);
+        return;
+    }
+
+    let initial = config::load_or_default(path)
+        .balance
+        .map(|balance| format!("{balance:.2}"));
+    let reply = match dialogs.prompt_text(
+        "OpenCode Zen balance",
+        "Current Zen balance (USD):",
+        initial.as_deref(),
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            let _ = dialogs.show_error(
+                "OpenCode Zen balance",
+                &format!("Could not ask for the balance: {error}"),
+            );
+            return;
+        }
+    };
+
+    let Some(reply) = reply else {
+        return; // cancelled
+    };
+    let text = reply.trim();
+    if !is_balance_amount(text) {
+        let _ = dialogs.show_error(
+            "OpenCode Zen balance",
+            &format!("\"{text}\" is not a valid balance amount"),
+        );
+        return;
+    }
+    if let Err(error) = config::set_value(path, "balance", text) {
+        let _ = dialogs.show_error(
+            "OpenCode Zen balance",
+            &format!("Could not save the balance: {error:#}"),
+        );
+    }
+}
+
+/// A non-negative, finite decimal as the config's balance parser expects it.
+fn is_balance_amount(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .parse::<f64>()
+            .is_ok_and(|value| value.is_finite() && value >= 0.0)
+}
+
+/// Open the config file with the desktop's default text editor via
+/// `xdg-open`, detached so the tray never waits. If `xdg-open` cannot be
+/// started, fall back to `$EDITOR`; if neither works, report it.
+fn open_config_file(path: &Path) {
+    let _ = config::load(path); // ensure the file (and its comments) exists
+
+    if std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .is_ok()
+    {
+        return;
+    }
+
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .filter(|editor| !editor.trim().is_empty());
+    let Some(editor) = editor else {
+        report_problem("could not open the config file with xdg-open and $EDITOR is not set");
+        return;
+    };
+
+    let mut parts = editor.split_whitespace();
+    let Some(program) = parts.next() else {
+        report_problem("could not open the config file with xdg-open and $EDITOR is empty");
+        return;
+    };
+    if let Err(error) = std::process::Command::new(program)
+        .args(parts)
+        .arg(path)
+        .spawn()
+    {
+        report_problem(&format!(
+            "could not open the config file with xdg-open or $EDITOR ({editor}): {error}"
+        ));
+    }
+}
+
+fn report_problem(message: &str) {
+    let dialogs = dialog::Dialogs::new();
+    if dialogs.available() {
+        let _ = dialogs.show_error("OpenCode config", message);
+    } else {
+        eprintln!("{message}");
     }
 }
 
@@ -574,7 +795,7 @@ impl Tray for UsageTray {
 #[command(
     version,
     about = "KDE tray traffic light for OpenCode Zen free-tier usage",
-    after_help = "examples:\n  opencode-usage-tracker                      run the tray\n  opencode-usage-tracker --once               print the hover text and exit\n  opencode-usage-tracker install              install for you\n  opencode-usage-tracker install --system --autostart\n  opencode-usage-tracker uninstall            remove the install"
+    after_help = "examples:\n  opencode-usage-tracker                      run the tray\n  opencode-usage-tracker --once               print the hover text and exit\n  opencode-usage-tracker install              install for you\n  opencode-usage-tracker install --system --autostart\n  opencode-usage-tracker uninstall            remove the install\n  opencode-usage-tracker config --list          show every key and value\n  opencode-usage-tracker config balance 25.00   set a value"
 )]
 struct Cli {
     /// Print the tray's hover text once and exit
@@ -623,6 +844,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Read or change configuration (git-config style)
+    Config {
+        /// List every key with its effective value
+        #[arg(long)]
+        list: bool,
+
+        /// Open the config file in $EDITOR
+        #[arg(long)]
+        edit: bool,
+
+        /// Key to read or set, e.g. balance, plan, go.tier
+        key: Option<String>,
+
+        /// New value; omit to read the current one
+        value: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +880,12 @@ async fn main() {
             } => install::install(*system, *autostart, from.as_deref()),
             Command::Uninstall { system } => install::uninstall(*system),
             Command::Stats { days, json } => stats::run(&db_path(), *days, *json),
+            Command::Config {
+                list,
+                edit,
+                key,
+                value,
+            } => config::run(*list, *edit, key.clone(), value.clone()),
         };
         if let Err(e) = outcome {
             eprintln!("error: {e:#}");
@@ -651,6 +895,7 @@ async fn main() {
     }
 
     let path = db_path();
+    let config_path = config::config_path();
 
     // One-shot mode: print the hover text (the same lines the tray shows) and
     // exit. Handy for testing the counting logic without a tray, or in scripts.
@@ -664,6 +909,9 @@ async fn main() {
             running: false,
             working: false,
             frame: 0,
+            config: config::load_or_default(&config_path),
+            config_path: config_path.clone(),
+            config_mtime: config::modified_ms(&config_path).unwrap_or(0),
         };
         snapshot.refresh();
         let hover = snapshot.hover();
@@ -684,6 +932,9 @@ async fn main() {
         running: false,
         working: false,
         frame: 0,
+        config: config::load_or_default(&config_path),
+        config_path: config_path.clone(),
+        config_mtime: config::modified_ms(&config_path).unwrap_or(0),
     };
     tray.refresh(); // first paint should already be right
     let mut working = tray.working;
@@ -719,13 +970,18 @@ async fn main() {
             let running = opencode_running();
             let w = working;
             handle
-                .update(|tray: &mut UsageTray| {
+                .update(move |tray: &mut UsageTray| {
                     tray.count = count;
                     tray.last_hour = last_hour;
                     tray.tokens = tokens;
                     tray.recent = recent;
                     tray.running = running;
                     tray.working = w;
+                    // The tray struct owns the config state; the poll only
+                    // asks it to reload when the file changed underneath us.
+                    if config::modified_ms(&tray.config_path).unwrap_or(0) != tray.config_mtime {
+                        tray.reload_config();
+                    }
                 })
                 .await;
             continue;
@@ -779,6 +1035,9 @@ mod tests {
             running,
             working: false,
             frame: 0,
+            config: config::Config::default(),
+            config_path: PathBuf::new(),
+            config_mtime: 0,
         }
     }
 
@@ -823,6 +1082,41 @@ mod tests {
                 .title
                 .contains("usage unavailable (database unreadable)")
         );
+    }
+
+    fn menu_labels(tray: &UsageTray) -> Vec<String> {
+        tray.menu()
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Standard(item) => Some(item.label),
+                MenuItem::SubMenu(item) => Some(item.label),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn set_balance_only_appears_for_the_credit_plan() {
+        let free = tray(Some(12), true);
+        let free_labels = menu_labels(&free);
+        assert!(!free_labels.iter().any(|label| label == "Set balance…"));
+        assert!(free_labels.iter().any(|label| label == "Plan: Free"));
+
+        let mut credit = tray(Some(12), true);
+        credit.config.plan = config::Plan::Credit;
+        let credit_labels = menu_labels(&credit);
+        assert!(credit_labels.iter().any(|label| label == "Set balance…"));
+        assert!(credit_labels.iter().any(|label| label == "Plan: Credit"));
+    }
+
+    #[test]
+    fn balance_input_validation() {
+        assert!(is_balance_amount("0"));
+        assert!(is_balance_amount("12.50"));
+        assert!(!is_balance_amount(""));
+        assert!(!is_balance_amount("-1"));
+        assert!(!is_balance_amount("abc"));
+        assert!(!is_balance_amount("NaN"));
     }
 
     /// Build the two tables `working_from` touches and seed one newest session.
