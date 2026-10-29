@@ -21,6 +21,18 @@ The tracker runs no INSERT, UPDATE, or DELETE statements, and it makes no networ
 
 The `stats` subcommand charts usage in the terminal: per UTC day, per model, or both, with token and cost breakdowns.
 
+## Quick start
+
+```sh
+git clone https://github.com/mudhairless/opencode-usage-tracker.git
+cd opencode-usage-tracker
+cargo build --release
+./target/release/opencode-usage-tracker install --autostart
+./target/release/opencode-usage-tracker
+```
+
+That is the whole setup for the default free plan: no configuration, no accounts, no network. The icon appears in the tray (on GNOME, enable the extension named in [Desktop support](#desktop-support) first, or nothing will show). Green means today's free-tier use is light, yellow means it is climbing, red means it is heavy; the tooltip and the right-click menu carry the exact counts. The paid plans need one setting each; see [Paid plans](#paid-plans).
+
 ## Requirements
 
 - Linux with a system tray that implements StatusNotifierItem. Development targets KDE Plasma. See [Desktop support](#desktop-support) for other desktops, including GNOME.
@@ -103,7 +115,8 @@ sudo ./target/release/opencode-usage-tracker uninstall --system
 | `opencode-usage-tracker` | Run the tray. |
 | `opencode-usage-tracker --once` | Print the tooltip text and exit. |
 | `opencode-usage-tracker install` | Install for the current user. |
-| `opencode-usage-tracker stats` | Chart free-tier usage per UTC day in the terminal. |
+| `opencode-usage-tracker config` | Read or change configuration (see [Configuration](#configuration)). |
+| `opencode-usage-tracker stats` | Chart usage in the terminal (see [The stats chart](#the-stats-chart)). |
 | `opencode-usage-tracker uninstall` | Remove an install for the current user. |
 
 `--once` prints the same lines as the tooltip:
@@ -113,6 +126,8 @@ $ opencode-usage-tracker --once
 OpenCode Zen Free Tier Usage
 250 requests today
 43 requests last hour
+9.6M tokens today
+612 requests last 3 days · 31.2M tokens
 Resets at 7:00 PM
 ```
 
@@ -120,34 +135,55 @@ If the database cannot be read, `--once` prints `usage unavailable (database unr
 
 ### The tray item
 
-- Hovering shows today's count, the last hour's count, and the next reset time.
+- Hovering shows today's free requests, the last hour's count, today's tokens, the last 3 days' totals, and the next reset time. On a paid plan it adds that plan's line: the estimated credit balance left, or the Go model closest to a window limit.
+- The menu carries the same figures in full: a summary, a per-day breakdown of the last 3 days, the paid plan's detail, a **Configure** submenu, **Refresh now**, and **Quit**.
 - Clicking the icon refreshes the counts.
-- The menu holds a summary line, **Refresh now**, and **Quit**.
+- While a request is streaming, the tracker polls once a second and animates the icon.
 - While OpenCode is not running, the icon is green and Plasma moves the item to the hidden tray area. The tooltip adds an `OpenCode not running` line.
 
 ### The stats chart
 
-`stats` buckets the same rows into UTC days, one bar per day. Bars are eight columns wide with a one column gap, so the default day count is whichever whole number of bars fits across the terminal. Each bar prints its count at its base, tokens as `47.21M` and request counts as whole numbers, and a box in the top-right corner names what the bars count.
+`stats` draws one bar per row of its report. With no options the rows are UTC days; the grouping options below make them models, or days crossed with models. Bars are eight columns wide with a one column gap, wider when a label needs the room, so the default day count is whichever whole number of bars fits across the terminal. Each bar prints its value at its base (tokens as `47.21M`, request counts whole, cost in dollars), and a box in the top-right corner names the metric on show.
 
 | Key | Effect |
 | --- | --- |
-| `←` and `→`, or `h` and `l` | Slide the window one day. Works only when more days are loaded than fit on screen. |
-| `Tab` | Switch between tokens and requests. |
+| `←` and `→`, or `h` and `l` | Slide the window one row. Works only when more rows are loaded than fit on screen. |
+| `Tab` | Cycle the metric: tokens, requests, and cost with the default fields. A narrower `--fields` selection cycles what it carries. |
 | `b` | Switch between bars and a line. |
 | `q` or `Esc` | Quit. |
 
 ### stats options
 
+The options compose: pick a range, a grouping, the metric columns, and any filters.
+
 | Option | Effect |
 | --- | --- |
-| `--days N` | How many days back to report, 1 to 365. Defaults to the most days whose bars fit across the terminal, and to 7 with `--json`. |
-| `--json` | Print the per-day rows and totals as JSON instead of the chart. |
+| `--days N` | The last N days ending today, 1 to 365. Defaults to the most days whose bars fit across the terminal, and to 7 with `--json` or `--text`. Cannot be combined with `--from`/`--to`. |
+| `--from DATE` | Start of the range as a UTC date (`YYYY-MM-DD`). |
+| `--to DATE` | End of the range as a UTC date, inclusive. With only one of `--from`/`--to`, the other end defaults from it. |
+| `--by LIST` | Grouping: `day`, `model`, `day,model`, or `model,day`. Default `day`. |
+| `--fields LIST` | Metric columns: `requests`, `tokens`, `input`, `output`, `reasoning`, `cache-read`, `cache-write`, `cost`. `tokens` selects the total plus all five token buckets. Default: all. |
+| `--model ID` | Only this model. `*` and `?` are wildcards. |
+| `--paid` | Only billed rows (recorded cost above zero). |
+| `--free` | Only free-pool rows. |
+| `--text` | Print the report as a table instead of the chart. |
+| `--json` | Print the report as JSON instead of the chart. |
 
-`--json` prints one object holding the days, a UTC timestamp, and the totals:
+Every row classifies three ways: `zen-free` (the shared free pool), `billed` (recorded cost above zero), and `other` (local providers, third-party zero-cost rows, and rows with no model, grouped as `(unknown)`). Unfiltered output carries the category on each row. `other` usage is never counted as free-pool usage or as paid spend, and rows with missing cost or token fields count those as zero.
+
+Worked examples:
+
+```sh
+opencode-usage-tracker stats --by day --fields cost --days 30   # daily spend, last month
+opencode-usage-tracker stats --model big-pickle --fields tokens --days 7
+opencode-usage-tracker stats --by day,model --paid --days 14     # paid models by day
+```
+
+`--json` prints one object: the rows and the totals over the whole filtered set. Totals always carry every metric, even when `--fields` narrows the rows.
 
 ```
-$ opencode-usage-tracker stats --days 2 --json
-{"days":[{"date":"2026-10-18","requests":525,"tokens":44405942},{"date":"2026-10-19","requests":434,"tokens":24847216}],"generated_at_utc":"2026-10-19T04:40:51Z","totals":{"requests":959,"tokens":69253158}}
+$ opencode-usage-tracker stats --days 1 --json
+{"rows":[{"cache_read":11000000,"cache_write":405942,"category":"zen-free","cost":0.0,"date":"2026-10-18","input":30000000,"output":2000000,"reasoning":1000000,"requests":525,"tokens":44405942},{"cache_read":0,"cache_write":0,"category":"billed","cost":0.42,"date":"2026-10-18","input":80000,"output":10000,"reasoning":0,"requests":3,"tokens":90000}],"totals":{"cache_read":11000000,"cache_write":405942,"cost":0.42,"input":30080000,"output":2010000,"reasoning":1000000,"requests":528,"tokens":44495942}}
 ```
 
 ## Counting
@@ -162,6 +198,28 @@ The tracker counts rows in `$HOME/.local/share/opencode/opencode.db`, table `ses
 
 The tracker opens the database read-write so that a pending WAL is replayed, then runs only SELECT statements. Set `OPENCODE_DB` to count from a different file.
 
+A word on what the counts mean: OpenCode Support describes the free allowance as a pool shared by every device behind your network's public IP address, reset at 00:00 UTC, and not a fixed number. Heavy use over recent days can lower it for a while. The counts here are exact, but no count can promise where the wall is; treat the light as a gauge of your own recent load, which is why the tray also shows the last 3 days.
+
+## Configuration
+
+Settings live in a TOML file at `$XDG_CONFIG_HOME/opencode-usage-tracker/config.toml` (usually `~/.config/opencode-usage-tracker/config.toml`). The file is created from a fully commented template on first use: the comments document every option, and the tray re-reads the file when it changes, so hand edits take effect on the next poll.
+
+Change settings three ways, all through the same writer so the comments survive:
+
+- The CLI, git-config style: `opencode-usage-tracker config plan go` sets a value, `opencode-usage-tracker config plan` reads it back, `config --list` shows everything, `config path` prints the file location, and `config --edit` opens the file in your editor.
+- The tray's **Configure** menu, which prompts with kdialog or zenity when either is installed and opens the config file when neither is.
+- Editing the file directly. If you set the balance by hand, set `balance_as_of` with it; the CLI and the menu stamp it for you, and the credit estimate stands on that stamp.
+
+| Key | Values | Meaning |
+| --- | --- | --- |
+| `plan` | `free`, `go`, `credit` | Which resource the light follows. Default `free`. |
+| `go.tier` | `go`, `go_plus`, `go_teams` | Your Go tier, whose per-model limits the Go light uses. |
+| `balance` | dollars | Current Zen credit balance (credit plan). Setting it stamps `balance_as_of`; reading it prints the stamp too. |
+| `balance_as_of` | UTC timestamp | When the balance was last set. Recorded spend after this moment is subtracted from the balance. |
+| `balance_reminder` | `true`, `false` | On OpenCode launch, remind when the balance is unset or a day old. Default `true`. |
+| `yellow_percent` | number | The credit light turns yellow when the estimated balance left falls below this percent of the balance as entered. Default 25. |
+| `red_percent` | number | The same for red. Default 10. |
+
 ## Paid plans
 
 The tracker also understands the two paid ways to use Zen. Set your plan with `opencode-usage-tracker config plan credit` or `opencode-usage-tracker config plan go`; `free` is the default.
@@ -171,19 +229,31 @@ The tracker also understands the two paid ways to use Zen. Set your plan with `o
 
 The Go support is **untested with actual data**. The prices and limits come from OpenCode's published pages, and the arithmetic is verified against synthetic records, but the maintainer does not subscribe to Go and has never checked the figures against a live account. If you do subscribe, feedback is very welcome: an issue setting the tracker's numbers beside the Zen console's is exactly what is needed to calibrate it.
 
+## Troubleshooting
+
+- **No tray icon at all.** On GNOME, install and enable the extension named in [Desktop support](#desktop-support). On other desktops, check that your panel implements StatusNotifierItem.
+- **The icon is gray.** The database could not be read: OpenCode has not run yet on this machine, the database is not where the tracker expects it, or it is locked. `--once` reports the same state as an error. Set `OPENCODE_DB` to point at a database in a nonstandard place.
+- **The icon is missing but the app is running.** While OpenCode is closed the tray item is passive, and Plasma moves passive items into the hidden tray area. It returns when OpenCode starts.
+- **The credit estimate looks wrong.** It subtracts only the spend recorded after `balance_as_of`, and it cannot see other machines on the same account. Re-enter the balance from the current Zen console figure.
+- **The Go figures look wrong.** They are estimates from published prices and limits, untested against a live account. See [Paid plans](#paid-plans), and please report the difference.
+
 ## Development
 
 ```sh
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cargo clippy --all-targets
 ```
 
-`cargo test` covers the installer, the desktop-entry rendering, the tooltip text, and the stats chart (day bucketing and bar layout). CI runs `cargo build` and `cargo test` on every push and pull request to `main`.
+That gate is what a change has to pass; see [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `cargo build` and `cargo test` on every push and pull request to `main`. The tests cover the config file and its CLI, the tray text, the stats engine and chart, the Go price tables, and the installer, all against scratch databases.
 
 Repository layout:
 
-- `src/main.rs` counts requests, draws the icon, and defines the command line.
-- `src/stats.rs` implements `stats`: the per-day query, the JSON output, and the terminal chart.
+- `src/main.rs` runs the tray, counts requests, draws the icon, and defines the command line.
+- `src/config.rs` holds the TOML configuration, its commented template, and the `config` CLI.
+- `src/dialog.rs` is the kdialog/zenity adapter behind the Configure menu, kept free of app types so it can become its own crate.
+- `src/go.rs` holds the Go price and limit tables and the rolling-window accounting.
+- `src/stats.rs` implements `stats`: the query engine, and its chart, table, and JSON renderings.
 - `src/install.rs` installs and uninstalls the executable and the desktop entry.
 - `OCUT.desktop` is the desktop-entry template. `src/install.rs` replaces its `@EXEC@` placeholder with the installed path. The menu entry uses the standard `utilities-system-monitor` icon.
 
