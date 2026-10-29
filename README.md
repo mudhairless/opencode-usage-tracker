@@ -19,10 +19,20 @@ The `stats` subcommand charts the same counts per UTC day in the terminal.
 
 ## Requirements
 
-- Linux with a system tray that implements StatusNotifierItem. Development targets KDE Plasma.
+- Linux with a system tray that implements StatusNotifierItem. Development targets KDE Plasma. See [Desktop support](#desktop-support) for other desktops, including GNOME.
 - Rust 1.88 or newer, because the code uses edition 2024 and let-chains.
 - A C compiler, because the bundled SQLite in `rusqlite` builds from source.
 - OpenCode used on the same machine, so that its database exists.
+
+## Desktop support
+
+The tray uses the StatusNotifierItem protocol. It works natively on KDE Plasma, XFCE, LXQt, MATE, and Cinnamon, and in standalone bars such as waybar.
+
+GNOME does not implement StatusNotifierItem on its own. Install and enable the **AppIndicator and KStatusNotifierItem Support** extension (preinstalled on Ubuntu) or no tray icon will appear at all. The extension does not implement tooltips, so on GNOME the right-click menu is the readout: it carries the same lines as the tooltip.
+
+Pantheon's wingpanel is not supported.
+
+Desktop notifications (the credit balance reminder) work on KDE and GNOME. On a notification daemon without action button support, the reminder still shows its text, including the command that sets the balance.
 
 ## Build
 
