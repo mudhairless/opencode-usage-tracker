@@ -148,6 +148,15 @@ The tracker counts rows in `$HOME/.local/share/opencode/opencode.db`, table `ses
 
 The tracker opens the database read-write so that a pending WAL is replayed, then runs only SELECT statements. Set `OPENCODE_DB` to count from a different file.
 
+## Paid plans
+
+The tracker also understands the two paid ways to use Zen. Set your plan with `opencode-usage-tracker config plan credit` or `opencode-usage-tracker config plan go`; `free` is the default.
+
+- **Zen credit.** You enter your current balance (the tray's Configure menu, or `opencode-usage-tracker config balance 25.00`), and the tracker subtracts the recorded cost of paid requests made after the moment you entered it. The light follows the estimated balance left. Spend from other machines on the same account is not in the local database, so the estimate cannot see it.
+- **OpenCode Go.** Go usage within its limits records a cost of zero, so the tracker prices each request's tokens with OpenCode's published per-model rates and compares the totals against the published window limits (5 hours at 20% of the monthly limit, 7 days at 50%, the month at 100%) for your tier.
+
+The Go support is **untested with actual data**. The prices and limits come from OpenCode's published pages, and the arithmetic is verified against synthetic records, but the maintainer does not subscribe to Go and has never checked the figures against a live account. If you do subscribe, feedback is very welcome: an issue setting the tracker's numbers beside the Zen console's is exactly what is needed to calibrate it.
+
 ## Development
 
 ```sh
@@ -163,6 +172,10 @@ Repository layout:
 - `src/stats.rs` implements `stats`: the per-day query, the JSON output, and the terminal chart.
 - `src/install.rs` installs and uninstalls the executable and the desktop entry.
 - `OCUT.desktop` is the desktop-entry template. `src/install.rs` replaces its `@EXEC@` placeholder with the installed path. The menu entry uses the standard `utilities-system-monitor` icon.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report problems and send changes, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the community rules.
 
 ## License
 
