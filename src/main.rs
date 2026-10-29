@@ -333,6 +333,51 @@ fn credit_spend(path: &PathBuf, config: &config::Config) -> Option<f64> {
     spend_since(path, config.balance_time()?.timestamp_millis())
 }
 
+/// The credit runway in days: the estimated balance left, divided by
+/// the average daily billed cost of the last 7 UTC days. `None` when
+/// there is no usable balance, nothing is left, or the week had no
+/// billed spend — dividing by a zero burn rate would print a figure
+/// with no meaning. A planning gauge, not a prediction: it inherits
+/// the credit estimate's blindness to other machines.
+fn runway_days(path: &PathBuf, config: &config::Config, spend: Option<f64>) -> Option<f64> {
+    if config.plan != config::Plan::Credit {
+        return None;
+    }
+    let remaining = config.balance? - spend?;
+    if remaining <= 0.0 {
+        return None;
+    }
+    let today = utc_day_start_ms(now_ms()?);
+    let query = stats::Query {
+        from_ms: today - 6 * 86_400_000,
+        to_ms: today + 86_400_000,
+        by: Vec::new(),
+        fields: stats::Fields::all(),
+        model_glob: None,
+        category: Some(stats::Category::Billed),
+    };
+    let week = stats::collect_report(path, &query)?.totals.cost;
+    if week <= 0.0 {
+        return None;
+    }
+    Some(remaining / (week / 7.0))
+}
+
+/// The runway as it prints: hours when under a day (where precision
+/// matters most), a decimal under two days, whole days above that,
+/// and a cap where the exact figure stops being useful.
+fn runway_text(days: f64) -> String {
+    if days >= 180.0 {
+        "180+ days".to_string()
+    } else if days >= 2.0 {
+        format!("{days:.0} days")
+    } else if days >= 1.0 {
+        format!("{days:.1} days")
+    } else {
+        format!("{:.0} hours", days * 24.0)
+    }
+}
+
 /// The Go-mode usage the tray shows, collected only on the Go plan.
 fn go_usage(path: &PathBuf, config: &config::Config) -> Option<Vec<go::ModelUsage>> {
     if config.plan != config::Plan::Go {
@@ -467,6 +512,7 @@ struct UsageTray {
     tokens: Option<u64>,
     recent: Option<Vec<stats::DayStats>>,
     spend: Option<f64>,
+    runway: Option<f64>,
     go: Option<Vec<go::ModelUsage>>,
     running: bool,
     working: bool,
@@ -492,6 +538,7 @@ impl UsageTray {
         self.tokens = tokens_today(&self.path);
         self.recent = stats::collect(&self.path, 3);
         self.spend = credit_spend(&self.path, &self.config);
+        self.runway = runway_days(&self.path, &self.config, self.spend);
         self.go = go_usage(&self.path, &self.config);
         self.running = opencode_running(); // <- new
         // A run can't be in flight if OpenCode isn't running. Gating here also
@@ -529,10 +576,17 @@ impl UsageTray {
     fn credit_line(&self) -> String {
         match (self.config.balance, self.spend) {
             (Some(balance), Some(spend)) => {
-                format!(
+                let mut line = format!(
                     "\n~${:.2} of ${balance:.2} Zen credit left",
                     balance - spend
-                )
+                );
+                if let Some(days) = self.runway {
+                    line.push_str(&format!(
+                        "\nRunway: ~{} at the last 7 days' burn",
+                        runway_text(days)
+                    ));
+                }
+                line
             }
             (Some(balance), None) => format!("\n${balance:.2} Zen credit (spend unavailable)"),
             _ => "\nZen credit balance not set".to_string(),
@@ -650,6 +704,12 @@ impl UsageTray {
                             s.push_str(
                                 "\n(covers this machine only; other devices are not counted)",
                             );
+                            if let Some(days) = self.runway {
+                                s.push_str(&format!(
+                                    "\nRunway: ~{} at the last 7 days' burn",
+                                    runway_text(days)
+                                ));
+                            }
                         }
                         (Some(balance), None) => {
                             s.push_str(&format!(
@@ -1221,6 +1281,7 @@ async fn main() {
             tokens: None,
             recent: None,
             spend: None,
+            runway: None,
             go: None,
             running: false,
             working: false,
@@ -1246,6 +1307,7 @@ async fn main() {
         tokens: None,
         recent: None,
         spend: None,
+        runway: None,
         go: None,
         running: false,
         working: false,
@@ -1361,6 +1423,7 @@ mod tests {
                 },
             ]),
             spend: None,
+            runway: None,
             go: None,
             running,
             working: false,
@@ -1427,6 +1490,35 @@ mod tests {
         assert!(t.level() == Level::Green);
         t.spend = Some(24.0);
         assert!(t.level() == Level::Red);
+    }
+
+    #[test]
+    fn credit_runway_prints_beside_the_balance() {
+        let mut t = tray(Some(12), true);
+        t.config.plan = config::Plan::Credit;
+        t.config.balance = Some(25.0);
+        t.spend = Some(5.0);
+        t.runway = Some(6.25);
+        assert!(
+            t.hover()
+                .title
+                .contains("\nRunway: ~6 days at the last 7 days' burn")
+        );
+        assert!(t.summary().contains("Runway: ~6 days"));
+        // No runway figure, no runway line.
+        t.runway = None;
+        assert!(!t.hover().title.contains("Runway"));
+    }
+
+    #[test]
+    fn runway_text_bands() {
+        assert_eq!(runway_text(0.25), "6 hours");
+        assert_eq!(runway_text(1.4), "1.4 days");
+        assert_eq!(runway_text(6.25), "6 days");
+        assert_eq!(runway_text(400.0), "180+ days");
+        // The default (free) plan never reaches the database here.
+        let t = tray(Some(1), true);
+        assert!(runway_days(&t.path, &t.config, None).is_none());
     }
 
     #[test]

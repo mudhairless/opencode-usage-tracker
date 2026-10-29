@@ -140,7 +140,8 @@ pub enum Group {
 
 /// Which metric columns a report carries. `tokens` in `--fields` selects
 /// the total plus all five component buckets; each bucket is also
-/// selectable on its own.
+/// selectable on its own. `cache_ratio` is derived from the cache-read
+/// and input buckets rather than stored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fields {
     pub requests: bool,
@@ -150,6 +151,7 @@ pub struct Fields {
     pub reasoning: bool,
     pub cache_read: bool,
     pub cache_write: bool,
+    pub cache_ratio: bool,
     pub cost: bool,
 }
 
@@ -163,6 +165,7 @@ impl Fields {
             reasoning: true,
             cache_read: true,
             cache_write: true,
+            cache_ratio: true,
             cost: true,
         }
     }
@@ -200,6 +203,18 @@ impl Metrics {
         self.input + self.output + self.reasoning + self.cache_read + self.cache_write
     }
 
+    /// The share of context tokens served from cache: cache reads over
+    /// cache reads plus fresh input. None when a row has neither, where
+    /// the share is undefined rather than zero.
+    pub fn cache_ratio(&self) -> Option<f64> {
+        let denom = self.cache_read + self.input;
+        if denom == 0 {
+            None
+        } else {
+            Some(self.cache_read as f64 / denom as f64)
+        }
+    }
+
     fn add(&mut self, other: &Metrics) {
         self.requests += other.requests;
         self.input += other.input;
@@ -221,12 +236,22 @@ pub struct ReportRow {
     pub metrics: Metrics,
 }
 
+/// The busiest single minute of a report: how many counted requests
+/// started in it, and the epoch millisecond it began at. It separates
+/// a heavy day from a bursty one, which daily totals cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeakMinute {
+    pub start_ms: i64,
+    pub requests: u64,
+}
+
 /// A finished report: rows in display order and the totals over the
 /// whole filtered set (every metric, not just the displayed fields).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
     pub rows: Vec<ReportRow>,
     pub totals: Metrics,
+    pub peak_minute: Option<PeakMinute>,
 }
 
 fn classify(v: &serde_json::Value, cost: f64) -> Category {
@@ -328,6 +353,7 @@ pub fn parse_fields(text: &str) -> Result<Fields, String> {
             "reasoning" => fields.reasoning = true,
             "cache-read" => fields.cache_read = true,
             "cache-write" => fields.cache_write = true,
+            "cache-ratio" => fields.cache_ratio = true,
             "cost" => fields.cost = true,
             other => return Err(format!("unknown field '{other}'")),
         }
@@ -374,6 +400,7 @@ pub fn collect_report(path: &PathBuf, query: &Query) -> Option<Report> {
     type Key = (Option<String>, Option<String>, Option<Category>);
     let mut grouped: std::collections::BTreeMap<Key, Metrics> = std::collections::BTreeMap::new();
     let mut totals = Metrics::default();
+    let mut minutes: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
     for row in rows {
         let Ok((msg_type, data, created)) = row else {
             continue;
@@ -414,6 +441,9 @@ pub fn collect_report(path: &PathBuf, query: &Query) -> Option<Report> {
             cost,
         };
         totals.add(&metrics);
+        *minutes
+            .entry(created.div_euclid(60_000) * 60_000)
+            .or_insert(0) += 1;
         let date = day_label(utc_day_start_ms(created));
         let mut slots = (None, None);
         for (i, group) in query.by.iter().enumerate() {
@@ -475,7 +505,18 @@ pub fn collect_report(path: &PathBuf, query: &Query) -> Option<Report> {
                 .then(a.model.cmp(&b.model))
         });
     }
-    Some(Report { rows: out, totals })
+    // The busiest minute: the highest count, ties to the earliest
+    // minute. The comparator is a total order, so the arbitrary
+    // iteration order of the map cannot leak into the result.
+    let peak_minute = minutes
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+        .map(|(start_ms, requests)| PeakMinute { start_ms, requests });
+    Some(Report {
+        rows: out,
+        totals,
+        peak_minute,
+    })
 }
 
 fn metrics_value(m: &Metrics, fields: Option<&Fields>) -> serde_json::Value {
@@ -502,15 +543,31 @@ fn metrics_value(m: &Metrics, fields: Option<&Fields>) -> serde_json::Value {
     if on(|f| f.cache_write) {
         obj.insert("cache_write".to_string(), m.cache_write.into());
     }
+    if on(|f| f.cache_ratio) {
+        obj.insert(
+            "cache_ratio".to_string(),
+            serde_json::json!(m.cache_ratio()),
+        );
+    }
     if on(|f| f.cost) {
         obj.insert("cost".to_string(), serde_json::json!(m.cost));
     }
     serde_json::Value::Object(obj)
 }
 
+/// A minute stamp as it prints: the caller picks the format, RFC 3339
+/// for JSON and a plainer one for the table.
+fn minute_label(start_ms: i64, format: &str) -> String {
+    chrono::DateTime::from_timestamp_millis(start_ms)
+        .map(|t| t.format(format).to_string())
+        .unwrap_or_default()
+}
+
 /// The JSON shape every report is sieved through:
-/// `{ "rows": [...], "totals": {...} }`. Row objects carry only the
-/// selected fields; totals always carry every metric.
+/// `{ "rows": [...], "totals": {...}, "peak_minute": {...} }`. Row
+/// objects carry only the selected fields; totals always carry every
+/// metric. `peak_minute` is the busiest minute of the filtered set, or
+/// null when the set is empty.
 pub fn report_json(report: &Report, fields: &Fields) -> serde_json::Value {
     let rows = report
         .rows
@@ -535,6 +592,13 @@ pub fn report_json(report: &Report, fields: &Fields) -> serde_json::Value {
     serde_json::json!({
         "rows": rows,
         "totals": metrics_value(&report.totals, None),
+        "peak_minute": match report.peak_minute {
+            Some(peak) => serde_json::json!({
+                "at": minute_label(peak.start_ms, "%Y-%m-%dT%H:%M:%SZ"),
+                "requests": peak.requests,
+            }),
+            None => serde_json::Value::Null,
+        },
     })
 }
 
@@ -574,6 +638,9 @@ pub fn render_table(report: &Report, query: &Query) -> String {
     if fields.cache_write {
         headers.push("cache-write");
     }
+    if fields.cache_ratio {
+        headers.push("cache-ratio");
+    }
     if fields.cost {
         headers.push("cost");
     }
@@ -587,6 +654,9 @@ pub fn render_table(report: &Report, query: &Query) -> String {
             "reasoning" => m.reasoning.to_string(),
             "cache-read" => m.cache_read.to_string(),
             "cache-write" => m.cache_write.to_string(),
+            "cache-ratio" => m
+                .cache_ratio()
+                .map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0)),
             "cost" => format!("${:.2}", m.cost),
             _ => String::new(),
         }
@@ -658,6 +728,13 @@ pub fn render_table(report: &Report, query: &Query) -> String {
     out.push('\n');
     out.push_str(&format_row(&total_cells));
     out.push('\n');
+    if let Some(peak) = report.peak_minute {
+        out.push_str(&format!(
+            "Busiest minute: {} requests at {}\n",
+            peak.requests,
+            minute_label(peak.start_ms, "%Y-%m-%d %H:%M UTC")
+        ));
+    }
     out
 }
 
@@ -755,6 +832,7 @@ enum Metric {
     Tokens,
     Requests,
     Cost,
+    CacheRatio,
     Input,
     Output,
     Reasoning,
@@ -768,6 +846,7 @@ impl Metric {
             Metric::Tokens => "tokens",
             Metric::Requests => "requests",
             Metric::Cost => "cost",
+            Metric::CacheRatio => "cache-ratio",
             Metric::Input => "input",
             Metric::Output => "output",
             Metric::Reasoning => "reasoning",
@@ -781,6 +860,7 @@ impl Metric {
             Metric::Tokens => m.tokens() as f64,
             Metric::Requests => m.requests as f64,
             Metric::Cost => m.cost,
+            Metric::CacheRatio => m.cache_ratio().unwrap_or(0.0) * 100.0,
             Metric::Input => m.input as f64,
             Metric::Output => m.output as f64,
             Metric::Reasoning => m.reasoning as f64,
@@ -803,6 +883,9 @@ impl Metric {
         match self {
             Metric::Tokens => format_precise_tokens(m.tokens()),
             Metric::Cost => format!("${:.2}", m.cost),
+            Metric::CacheRatio => m
+                .cache_ratio()
+                .map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0)),
             _ => format!("{}", self.raw(m) as u64),
         }
     }
@@ -811,6 +894,7 @@ impl Metric {
         match self {
             Metric::Tokens => format_tokens(v as u64),
             Metric::Cost => format!("${v:.2}"),
+            Metric::CacheRatio => format!("{v:.0}%"),
             _ => format!("{v:.0}"),
         }
     }
@@ -845,6 +929,9 @@ fn metrics_for(query: &Query) -> Vec<Metric> {
     }
     if fields.cost && query.category != Some(Category::ZenFree) {
         out.push(Metric::Cost);
+    }
+    if fields.cache_ratio {
+        out.push(Metric::CacheRatio);
     }
     if !fields.tokens {
         if fields.input {
@@ -1382,9 +1469,67 @@ mod tests {
         assert!(table.contains("$1.75"), "table:\n{table}");
         assert!(table.contains("zen-free"), "table:\n{table}");
         // The totals footer carries the same request count as the JSON.
-        let footer = table.lines().last().unwrap();
+        let footer = table
+            .lines()
+            .find(|l| l.starts_with("total"))
+            .expect("totals footer");
         assert!(footer.starts_with("total"), "footer: {footer}");
         assert!(footer.contains("7"), "footer: {footer}");
+        // Four finished rows share the fixture's first hour, so the
+        // busiest minute names it, in the JSON and the table both.
+        assert_eq!(json["peak_minute"]["requests"], 4);
+        assert_eq!(json["peak_minute"]["at"], "2026-10-20T01:00:00Z");
+        assert!(
+            table.contains("Busiest minute: 4 requests at 2026-10-20 01:00 UTC"),
+            "table:\n{table}"
+        );
+    }
+
+    #[test]
+    fn peak_minute_counts_and_breaks_ties() {
+        let path = scratch_db("peak");
+        let conn = Connection::open(&path).unwrap();
+        let day = parse_day("2026-10-20").unwrap();
+        let minute = 60_000;
+        // Three requests in minute 5, three in minute 2: the tie goes
+        // to the earlier minute. One more in minute 5 is unfinished
+        // and must not count.
+        for i in 0..3 {
+            insert_row(
+                &conn,
+                day + 5 * minute + i * 1000,
+                Some(("opencode", "big-pickle")),
+                1,
+                None,
+                true,
+            );
+            insert_row(
+                &conn,
+                day + 2 * minute + i * 1000,
+                Some(("opencode", "big-pickle")),
+                1,
+                None,
+                true,
+            );
+        }
+        insert_row(
+            &conn,
+            day + 5 * minute,
+            Some(("opencode", "big-pickle")),
+            1,
+            None,
+            false,
+        );
+        drop(conn);
+        let report = collect_report(&path, &query(day, day + DAY_MS)).expect("report");
+        let peak = report.peak_minute.expect("peak");
+        assert_eq!(peak.requests, 3);
+        assert_eq!(peak.start_ms, day + 2 * minute);
+        // An empty range has no busiest minute.
+        let empty = collect_report(&path, &query(day + DAY_MS, day + 2 * DAY_MS)).expect("report");
+        let _ = std::fs::remove_file(&path);
+        assert!(empty.rows.is_empty());
+        assert!(empty.peak_minute.is_none());
     }
 
     #[test]
@@ -1460,7 +1605,12 @@ mod tests {
         let mut q = query(0, 0);
         assert_eq!(
             metrics_for(&q),
-            vec![Metric::Tokens, Metric::Requests, Metric::Cost]
+            vec![
+                Metric::Tokens,
+                Metric::Requests,
+                Metric::Cost,
+                Metric::CacheRatio
+            ]
         );
         q.fields = parse_fields("cost").unwrap();
         assert_eq!(metrics_for(&q), vec![Metric::Cost]);
@@ -1473,7 +1623,37 @@ mod tests {
         // The free pool is zero-cost by definition: no cost chart.
         q.fields = Fields::all();
         q.category = Some(Category::ZenFree);
-        assert_eq!(metrics_for(&q), vec![Metric::Tokens, Metric::Requests]);
+        assert_eq!(
+            metrics_for(&q),
+            vec![Metric::Tokens, Metric::Requests, Metric::CacheRatio]
+        );
+    }
+
+    #[test]
+    fn cache_ratio_is_a_field() {
+        let fields = parse_fields("cache-ratio").unwrap();
+        assert!(fields.cache_ratio && !fields.requests);
+        // The ratio is cache reads over reads plus fresh input, and
+        // undefined when a row has neither.
+        let m = Metrics {
+            input: 30,
+            cache_read: 70,
+            ..Metrics::default()
+        };
+        assert_eq!(m.cache_ratio(), Some(0.7));
+        assert_eq!(Metrics::default().cache_ratio(), None);
+        // Through the sieve: rows and totals both carry it, and the
+        // table prints the same share as a percent.
+        let (path, day) = fixture_db("ratio");
+        let q = query(day, day + 2 * DAY_MS);
+        let report = collect_report(&path, &q).expect("report");
+        let _ = std::fs::remove_file(&path);
+        let json = report_json(&report, &Fields::all());
+        assert!(json["totals"]["cache_ratio"].is_number());
+        assert!(json["rows"][0].get("cache_ratio").is_some());
+        let table = render_table(&report, &q);
+        assert!(table.contains("cache-ratio"), "table:\n{table}");
+        assert!(table.contains("0.0%"), "table:\n{table}");
     }
 
     #[test]

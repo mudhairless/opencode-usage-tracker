@@ -162,7 +162,7 @@ The options compose: pick a range, a grouping, the metric columns, and any filte
 | `--from DATE` | Start of the range as a UTC date (`YYYY-MM-DD`). |
 | `--to DATE` | End of the range as a UTC date, inclusive. With only one of `--from`/`--to`, the other end defaults from it. |
 | `--by LIST` | Grouping: `day`, `model`, `day,model`, or `model,day`. Default `day`. |
-| `--fields LIST` | Metric columns: `requests`, `tokens`, `input`, `output`, `reasoning`, `cache-read`, `cache-write`, `cost`. `tokens` selects the total plus all five token buckets. Default: all. |
+| `--fields LIST` | Metric columns: `requests`, `tokens`, `input`, `output`, `reasoning`, `cache-read`, `cache-write`, `cache-ratio`, `cost`. `tokens` selects the total plus all five token buckets; `cache-ratio` is the share of context tokens served from cache (cache reads over cache reads plus fresh input). Default: all. |
 | `--model ID` | Only this model. `*` and `?` are wildcards. |
 | `--paid` | Only billed rows (recorded cost above zero). |
 | `--free` | Only free-pool rows. |
@@ -179,7 +179,7 @@ opencode-usage-tracker stats --model big-pickle --fields tokens --days 7
 opencode-usage-tracker stats --by day,model --paid --days 14     # paid models by day
 ```
 
-`--json` prints one object: the rows and the totals over the whole filtered set. Totals always carry every metric, even when `--fields` narrows the rows.
+`--json` prints one object: the rows and the totals over the whole filtered set. Totals always carry every metric, even when `--fields` narrows the rows. The object also names the busiest single minute of the range as `peak_minute` (its start as an RFC 3339 timestamp and its request count, or `null` when the range is empty), and the text table prints the same figure under the totals. It separates a heavy day from a bursty one: the same daily total reads very differently when most of its requests landed inside a few minutes.
 
 ```
 $ opencode-usage-tracker stats --days 1 --json
@@ -224,7 +224,7 @@ Change settings three ways, all through the same writer so the comments survive:
 
 The tracker also understands the two paid ways to use Zen. Set your plan with `opencode-usage-tracker config plan credit` or `opencode-usage-tracker config plan go`; `free` is the default.
 
-- **Zen credit.** You enter your current balance (the tray's Configure menu, or `opencode-usage-tracker config balance 25.00`), and the tracker subtracts the recorded cost of paid requests made after the moment you entered it. The light follows the estimated balance left. Spend from other machines on the same account is not in the local database, so the estimate cannot see it.
+- **Zen credit.** You enter your current balance (the tray's Configure menu, or `opencode-usage-tracker config balance 25.00`), and the tracker subtracts the recorded cost of paid requests made after the moment you entered it. The light follows the estimated balance left. Spend from other machines on the same account is not in the local database, so the estimate cannot see it. When the last 7 days include billed spend, the hover and menu add a runway line: the estimated balance left divided by that week's average daily burn.
 - **OpenCode Go.** Go usage within its limits records a cost of zero, so the tracker prices each request's tokens with OpenCode's published per-model rates and compares the totals against the published window limits (5 hours at 20% of the monthly limit, 7 days at 50%, the month at 100%) for your tier.
 
 The Go support is **untested with actual data**. The prices and limits come from OpenCode's published pages, and the arithmetic is verified against synthetic records, but the maintainer does not subscribe to Go and has never checked the figures against a live account. If you do subscribe, feedback is very welcome: an issue setting the tracker's numbers beside the Zen console's is exactly what is needed to calibrate it.
