@@ -77,22 +77,20 @@ fn opencode_running() -> bool {
                 .split(|b| *b == 0)
                 .filter(|arg| !arg.is_empty())
                 .collect();
-        
+
             if let Some(argv0) = args.first() {
                 let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
-        
+
                 if base == b"opencode" {
                     let is_service = args.get(1).copied() == Some(b"serve".as_slice())
                         && args.get(2).copied() == Some(b"--service".as_slice());
-                    
-        
+
                     if !is_service {
                         return true;
                     }
                 }
             }
         }
-        
     }
     false
 }
@@ -134,7 +132,6 @@ fn working_from(conn: &Connection) -> bool {
     )
     .unwrap_or(false)
 }
-
 
 fn now_ms() -> Option<i64> {
     SystemTime::now()
@@ -267,9 +264,8 @@ fn tokens_in(v: &serde_json::Value) -> u64 {
         Some(t) => t,
         None => return 0,
     };
-    let bucket = |n: &serde_json::Value, key: &str| {
-        n.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
-    };
+    let bucket =
+        |n: &serde_json::Value, key: &str| n.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
     bucket(t, "input")
         + bucket(t, "output")
         + bucket(t, "reasoning")
@@ -351,7 +347,11 @@ fn make_icon(level: Level, spin: Option<u8>) -> Icon {
                 let ring_r = c - 1.25;
                 if (dist - ring_r).abs() <= THROBBER_THICKNESS {
                     let phi = (-dy).atan2(dx);
-                    let phi = if phi < 0.0 { phi + std::f32::consts::TAU } else { phi };
+                    let phi = if phi < 0.0 {
+                        phi + std::f32::consts::TAU
+                    } else {
+                        phi
+                    };
                     let head = (frame as f32 / SPIN_FRAMES as f32) * std::f32::consts::TAU;
                     let behind = (head - phi).rem_euclid(std::f32::consts::TAU);
                     if behind < ARC {
@@ -361,7 +361,7 @@ fn make_icon(level: Level, spin: Option<u8>) -> Icon {
                     }
                 }
             }
-            
+
             // gentle top-down shading so it reads as a little lamp
             let shade = if dist <= radius {
                 1.0 - (dy / (radius * 2.0) + 0.5) * 0.25
@@ -398,6 +398,7 @@ struct UsageTray {
     count: Option<u32>,
     last_hour: Option<u32>,
     tokens: Option<u64>,
+    recent: Option<Vec<stats::DayStats>>,
     running: bool,
     working: bool,
     frame: u8,
@@ -408,6 +409,7 @@ impl UsageTray {
         self.count = count_today(&self.path);
         self.last_hour = count_last_hour(&self.path);
         self.tokens = tokens_today(&self.path);
+        self.recent = stats::collect(&self.path, 3);
         self.running = opencode_running(); // <- new
         // A run can't be in flight if OpenCode isn't running. Gating here also
         // covers a session OpenCode left unfinished (killed mid-run) instead
@@ -415,7 +417,7 @@ impl UsageTray {
         self.working = self.running && session_working(&self.path);
     }
     fn level(&self) -> Level {
-        	level_for(self.count)
+        level_for(self.count)
     }
     /// The hover text: title lines plus the reset time. Shared with `--once`
     /// so the CLI and the tray can't drift apart.
@@ -428,11 +430,24 @@ impl UsageTray {
             Some(n) => {
                 title.push_str(&format!(
                     "\n{n} requests today\n{} requests last hour",
-                    self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string())
+                    self.last_hour
+                        .map_or_else(|| "?".to_string(), |m| m.to_string())
                 ));
                 match self.tokens {
                     Some(t) => title.push_str(&format!("\n{} tokens today", format_tokens(t))),
                     None => title.push_str("\ntokens unavailable"),
+                }
+                match &self.recent {
+                    Some(days) => {
+                        let (requests, tokens) = days
+                            .iter()
+                            .fold((0u32, 0u64), |(r, t), d| (r + d.requests, t + d.tokens));
+                        title.push_str(&format!(
+                            "\n{requests} requests last 3 days · {} tokens",
+                            format_tokens(tokens)
+                        ));
+                    }
+                    None => title.push_str("\nlast 3 days unavailable"),
                 }
             }
             None => title.push_str("\nusage unavailable (database unreadable)"),
@@ -448,13 +463,30 @@ impl UsageTray {
             Some(n) => {
                 let mut s = format!(
                     "{n} requests today\n{} requests last hour",
-                    self.last_hour.map_or_else(|| "?".to_string(), |m| m.to_string()),
+                    self.last_hour
+                        .map_or_else(|| "?".to_string(), |m| m.to_string()),
                 );
                 match self.tokens {
                     Some(t) => s.push_str(&format!("\n{} tokens today", format_tokens(t))),
                     None => s.push_str("\ntokens unavailable"),
                 }
                 s.push_str(&format!("\nresets at {}", reset_local_time()));
+                match &self.recent {
+                    Some(days) => {
+                        s.push_str("\nLast 3 days:");
+                        let last = days.len().saturating_sub(1);
+                        for (i, day) in days.iter().enumerate() {
+                            let today = if i == last { " (today)" } else { "" };
+                            s.push_str(&format!(
+                                "\n{}: {} requests · {} tokens{today}",
+                                day.date,
+                                day.requests,
+                                format_tokens(day.tokens)
+                            ));
+                        }
+                    }
+                    None => s.push_str("\nlast 3 days unavailable"),
+                }
                 s
             }
             None => "usage unavailable (database unreadable)".to_string(),
@@ -495,7 +527,7 @@ impl Tray for UsageTray {
         let spin = if self.working { Some(self.frame) } else { None };
         vec![make_icon(self.level(), spin)]
     }
-    
+
     fn tool_tip(&self) -> ToolTip {
         let hover = self.hover();
         ToolTip {
@@ -628,6 +660,7 @@ async fn main() {
             count: None,
             last_hour: None,
             tokens: None,
+            recent: None,
             running: false,
             working: false,
             frame: 0,
@@ -647,12 +680,13 @@ async fn main() {
         count: None,
         last_hour: None,
         tokens: None,
+        recent: None,
         running: false,
         working: false,
         frame: 0,
     };
     tray.refresh(); // first paint should already be right
-	let mut working = tray.working;
+    let mut working = tray.working;
     let handle = match tray.spawn().await {
         Ok(h) => h,
         Err(e) => {
@@ -663,24 +697,25 @@ async fn main() {
 
     let mut beat = tokio::time::interval(SPIN_TICK);
     let mut ticks: u64 = 0;
-    
+
     let mut frame: u8 = 0;
     loop {
         beat.tick().await;
         ticks = ticks.wrapping_add(1);
-    
+
         let was_working = working;
         if ticks.is_multiple_of(4) {
             // 1s cadence. The /proc scan is cheap, and gating on it clears
             // `working` when OpenCode isn't running (e.g. killed mid-run).
             working = opencode_running() && session_working(&path);
         }
-    
+
         if ticks.is_multiple_of(TICKS_PER_POLL) {
             // your existing full poll, unchanged apart from also storing working
             let count = count_today(&path);
             let last_hour = count_last_hour(&path);
             let tokens = tokens_today(&path);
+            let recent = stats::collect(&path, 3);
             let running = opencode_running();
             let w = working;
             handle
@@ -688,13 +723,14 @@ async fn main() {
                     tray.count = count;
                     tray.last_hour = last_hour;
                     tray.tokens = tokens;
+                    tray.recent = recent;
                     tray.running = running;
                     tray.working = w;
                 })
                 .await;
             continue;
         }
-    
+
         if working {
             frame = (frame + 1) % SPIN_FRAMES;
             let f = frame;
@@ -711,7 +747,6 @@ async fn main() {
                 .await;
         }
     }
-    
 }
 
 #[cfg(test)]
@@ -724,9 +759,26 @@ mod tests {
             count,
             last_hour: Some(3),
             tokens: Some(12345),
+            recent: Some(vec![
+                stats::DayStats {
+                    date: "2026-10-27".to_string(),
+                    requests: 5,
+                    tokens: 1_000,
+                },
+                stats::DayStats {
+                    date: "2026-10-28".to_string(),
+                    requests: 6,
+                    tokens: 2_000,
+                },
+                stats::DayStats {
+                    date: "2026-10-29".to_string(),
+                    requests: 7,
+                    tokens: 3_000,
+                },
+            ]),
             running,
             working: false,
-            frame: 0
+            frame: 0,
         }
     }
 
@@ -735,9 +787,26 @@ mod tests {
         let hover = tray(Some(12), true).hover();
         assert_eq!(
             hover.title,
-            "OpenCode Zen Free Tier Usage\n12 requests today\n3 requests last hour\n12.3K tokens today"
+            "OpenCode Zen Free Tier Usage\n12 requests today\n3 requests last hour\n12.3K tokens today\n18 requests last 3 days · 6.0K tokens"
         );
         assert!(hover.description.starts_with("Resets at "));
+    }
+
+    #[test]
+    fn summary_lists_each_of_the_last_three_days() {
+        let summary = tray(Some(12), true).summary();
+        assert!(summary.contains("\nLast 3 days:"));
+        assert!(summary.contains("\n2026-10-27: 5 requests · 1.0K tokens"));
+        assert!(summary.contains("\n2026-10-28: 6 requests · 2.0K tokens"));
+        assert!(summary.contains("\n2026-10-29: 7 requests · 3.0K tokens (today)"));
+    }
+
+    #[test]
+    fn missing_recent_stats_are_reported_as_unavailable() {
+        let mut t = tray(Some(12), true);
+        t.recent = None;
+        assert!(t.hover().title.contains("\nlast 3 days unavailable"));
+        assert!(t.summary().contains("\nlast 3 days unavailable"));
     }
 
     #[test]
@@ -749,7 +818,11 @@ mod tests {
     #[test]
     fn hover_reports_an_unreadable_database() {
         let hover = tray(None, true).hover();
-        assert!(hover.title.contains("usage unavailable (database unreadable)"));
+        assert!(
+            hover
+                .title
+                .contains("usage unavailable (database unreadable)")
+        );
     }
 
     /// Build the two tables `working_from` touches and seed one newest session.

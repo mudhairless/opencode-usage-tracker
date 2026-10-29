@@ -10,7 +10,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Executable and desktop-entry base name.
 const BIN: &str = env!("CARGO_PKG_NAME");
@@ -163,7 +163,10 @@ struct Target {
 
 fn target(system: bool, user: &User) -> Target {
     let (bin_dir, apps_dir) = if system {
-        (PathBuf::from(SYSTEM_BIN_DIR), PathBuf::from(SYSTEM_APPS_DIR))
+        (
+            PathBuf::from(SYSTEM_BIN_DIR),
+            PathBuf::from(SYSTEM_APPS_DIR),
+        )
     } else {
         (
             user.home.join(".local/bin"),
@@ -192,7 +195,9 @@ fn check_privileges(system: bool, action: &str, extra: &str) -> Result<()> {
             bail!("{action} --system needs root.\nre-run as:  sudo {BIN} {action} --system{extra}");
         }
     } else if current_euid() == Some(0) && escalated {
-        bail!("{action} only touches your own files — no root needed.\nre-run as:  {BIN} {action}{extra}");
+        bail!(
+            "{action} only touches your own files — no root needed.\nre-run as:  {BIN} {action}{extra}"
+        );
     }
     Ok(())
 }
@@ -211,7 +216,9 @@ fn source_binary(from: Option<&Path>) -> Result<PathBuf> {
 
 fn render_desktop(bin_path: &Path) -> Result<String> {
     if !TEMPLATE.contains(EXEC_TOKEN) {
-        bail!("desktop template has no {EXEC_TOKEN} placeholder — refusing to write a broken entry");
+        bail!(
+            "desktop template has no {EXEC_TOKEN} placeholder — refusing to write a broken entry"
+        );
     }
     let exec = bin_path.to_string_lossy().into_owned();
     // Exec= splits on unquoted spaces, so a path containing any has to be quoted.
@@ -231,7 +238,9 @@ fn write_file(path: &Path, contents: &str) -> Result<()> {
 }
 
 fn dir_in_path(dir: Option<&Path>) -> bool {
-    let Some(dir) = dir else { return false; };
+    let Some(dir) = dir else {
+        return false;
+    };
     let Ok(path) = std::env::var("PATH") else {
         return false;
     };
@@ -312,7 +321,9 @@ pub(crate) fn install(system: bool, autostart: bool, from: Option<&Path>) -> Res
         );
     }
     if src.to_string_lossy().contains("/target/debug/") {
-        println!("note: a debug build was installed — `cargo build --release` gives a smaller, faster binary");
+        println!(
+            "note: a debug build was installed — `cargo build --release` gives a smaller, faster binary"
+        );
     }
     Ok(())
 }
@@ -360,7 +371,8 @@ mod tests {
 
     #[test]
     fn desktop_entry_gets_the_installed_path() {
-        let text = render_desktop(Path::new("/home/mud/.local/bin/opencode-usage-tracker")).unwrap();
+        let text =
+            render_desktop(Path::new("/home/mud/.local/bin/opencode-usage-tracker")).unwrap();
         assert!(text.starts_with("[Desktop Entry]\n"));
         assert!(text.contains("Exec=/home/mud/.local/bin/opencode-usage-tracker\n"));
         assert!(!text.contains(EXEC_TOKEN));
@@ -374,10 +386,8 @@ mod tests {
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ocut-install-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ocut-install-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -419,7 +429,12 @@ mod tests {
         install_binary(&src, &link).unwrap();
 
         assert_eq!(fs::read(&real).unwrap(), b"keep");
-        assert!(!fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            !fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read(&link).unwrap(), b"new");
         fs::remove_dir_all(&dir).unwrap();
     }

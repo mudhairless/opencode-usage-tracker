@@ -12,15 +12,15 @@
 use std::io;
 use std::path::PathBuf;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::widgets::{Axis, Bar, BarChart, BarGroup, Chart, Dataset, GraphType};
-use ratatui::style::Style;
-use ratatui::layout::Alignment;
 use ratatui::Frame;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::layout::Alignment;
+use ratatui::style::Style;
 use ratatui::symbols;
+use ratatui::widgets::{Axis, Bar, BarChart, BarGroup, Chart, Dataset, GraphType};
 use serde::Serialize;
 
-use crate::{free_rows_between, format_tokens, now_ms, open_db, utc_day_start_ms, tokens_in};
+use crate::{format_tokens, free_rows_between, now_ms, open_db, tokens_in, utc_day_start_ms};
 
 const DAY_MS: i64 = 86_400_000;
 /// Columns one day's bar occupies, and the gap that separates it from the
@@ -81,7 +81,9 @@ pub fn collect(path: &PathBuf, days: u32) -> Option<Vec<DayStats>> {
 }
 
 fn total(stats: &[DayStats]) -> (u32, u64) {
-    stats.iter().fold((0, 0), |(r, t), d| (r + d.requests, t + d.tokens))
+    stats
+        .iter()
+        .fold((0, 0), |(r, t), d| (r + d.requests, t + d.tokens))
 }
 
 /// Like the tray's `format_tokens`, but two decimals, so neighbouring bars
@@ -104,7 +106,8 @@ fn render_json(stats: &[DayStats]) -> String {
             "tokens": d.tokens
         })).collect::<Vec<_>>(),
         "totals": { "requests": requests, "tokens": tokens },
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// The interactive chart: as many days as bars fit across the terminal, or
@@ -174,9 +177,15 @@ fn draw(
     let visible = &stats[window_start..window_start + max_visible];
     let (requests, tokens) = total(visible);
     let span = if visible.len() > 1 {
-        format!("{} … {}", visible.first().unwrap().date, visible.last().unwrap().date)
+        format!(
+            "{} … {}",
+            visible.first().unwrap().date,
+            visible.last().unwrap().date
+        )
     } else {
-        visible.first().map_or_else(|| "?".to_string(), |d| d.date.clone())
+        visible
+            .first()
+            .map_or_else(|| "?".to_string(), |d| d.date.clone())
     };
 
     let header = format!(
@@ -203,7 +212,13 @@ fn draw(
     let labels: Vec<String> = visible.iter().map(|d| d.date[5..].to_string()).collect();
     let values: Vec<u64> = visible
         .iter()
-        .map(|d| if mode == 0 { d.tokens } else { d.requests as u64 })
+        .map(|d| {
+            if mode == 0 {
+                d.tokens
+            } else {
+                d.requests as u64
+            }
+        })
         .collect();
     // The bar chart has no dataset names of its own, so both chart styles
     // pair a fill color with the name to label it with.
@@ -229,7 +244,15 @@ fn draw(
         } else {
             values.iter().map(ToString::to_string).collect()
         };
-        render_bars(frame, chunks[1], &values, &texts, &labels, color, value_style);
+        render_bars(
+            frame,
+            chunks[1],
+            &values,
+            &texts,
+            &labels,
+            color,
+            value_style,
+        );
         // Same corner, same box as the line chart's legend.
         render_bar_legend(frame, chunks[1], name, color);
         return;
@@ -318,12 +341,7 @@ fn render_bars(
 /// spelled out rather than left to inherit: the box overlaps the bars, and
 /// inherited styles would let the fill color bleed into the border and text
 /// where they cross a bar while the rest stayed in the default color.
-fn render_bar_legend(
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-    name: &str,
-    color: Style,
-) {
+fn render_bar_legend(frame: &mut Frame, area: ratatui::layout::Rect, name: &str, color: Style) {
     let width = (name.len() as u16 + 2).min(area.width);
     let rect = ratatui::layout::Rect {
         x: area.x + area.width - width,
@@ -342,18 +360,22 @@ fn render_bar_legend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
 
     /// A scratch database with OpenCode's `session_message` shape, so `collect`
     /// can be fed known rows without touching the real one.
     fn scratch_db(name: &str) -> PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("opencode-usage-tracker-{}-{name}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "opencode-usage-tracker-{}-{name}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let conn = Connection::open(&path).expect("scratch db");
-        conn.execute_batch("CREATE TABLE session_message \
-             (type TEXT, data TEXT, time_created INTEGER)")
-            .expect("schema");
+        conn.execute_batch(
+            "CREATE TABLE session_message \
+             (type TEXT, data TEXT, time_created INTEGER)",
+        )
+        .expect("schema");
         path
     }
 
@@ -404,7 +426,12 @@ mod tests {
         // A paid model and a row from tomorrow: neither may show up in any
         // bucket.
         insert(&conn, today + crate::AN_HOUR_IN_MS * 3, "gpt-5", 999_999);
-        insert(&conn, today + DAY_MS + crate::AN_HOUR_IN_MS, "big-pickle", 999_999);
+        insert(
+            &conn,
+            today + DAY_MS + crate::AN_HOUR_IN_MS,
+            "big-pickle",
+            999_999,
+        );
         drop(conn);
 
         let stats = collect(&path, 7).expect("collect");
@@ -434,6 +461,3 @@ pub fn run(path: &PathBuf, days: Option<u32>, json: bool) -> anyhow::Result<()> 
     run_chart(path, days)?;
     Ok(())
 }
-
-
-
