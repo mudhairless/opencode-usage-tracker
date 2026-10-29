@@ -357,6 +357,21 @@ fn render_bar_legend(frame: &mut Frame, area: ratatui::layout::Rect, name: &str,
         rect,
     );
 }
+pub fn run(path: &PathBuf, days: Option<u32>, json: bool) -> anyhow::Result<()> {
+    if json {
+        // No bars to fit on screen, so JSON reports a week unless told
+        // otherwise.
+        let Some(stats) = collect(path, days.unwrap_or(JSON_DAYS)) else {
+            anyhow::bail!("could not read {}", path.display());
+        };
+        println!("{}", render_json(&stats));
+        return Ok(());
+    }
+    // The chart sizes its own day count to the terminal when --days is off.
+    run_chart(path, days)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,19 +460,4 @@ mod tests {
             assert_eq!(day.tokens, 1_000 * (i as u64 + 1), "tokens on {}", day.date);
         }
     }
-}
-
-pub fn run(path: &PathBuf, days: Option<u32>, json: bool) -> anyhow::Result<()> {
-    if json {
-        // No bars to fit on screen, so JSON reports a week unless told
-        // otherwise.
-        let Some(stats) = collect(path, days.unwrap_or(JSON_DAYS)) else {
-            anyhow::bail!("could not read {}", path.display());
-        };
-        println!("{}", render_json(&stats));
-        return Ok(());
-    }
-    // The chart sizes its own day count to the terminal when --days is off.
-    run_chart(path, days)?;
-    Ok(())
 }

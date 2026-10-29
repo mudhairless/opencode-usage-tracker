@@ -290,6 +290,46 @@ fn tokens_today(path: &PathBuf) -> Option<u64> {
     tokens_on_day(path, utc_day_start_ms(now_ms()?))
 }
 
+/// Dollars of billed usage recorded at or after `since_ms`: every message
+/// whose recorded `cost` is positive, whatever the provider. Zen credit
+/// rows land here; free-tier and local rows record zero and drop out on
+/// their own, and a missing cost counts as zero. `None` when the database
+/// can't be read.
+fn spend_since(path: &PathBuf, since_ms: i64) -> Option<f64> {
+    let conn = open_db(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT data FROM session_message \
+             WHERE type IN ('assistant', 'compaction') AND time_created >= ?1",
+        )
+        .ok()?;
+    let rows = stmt.query_map([since_ms], |r| r.get::<_, String>(0)).ok()?;
+    let mut total = 0.0;
+    for row in rows {
+        let Ok(data) = row else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if let Some(cost) = v.get("cost").and_then(|c| c.as_f64())
+            && cost > 0.0
+        {
+            total += cost;
+        }
+    }
+    Some(total)
+}
+
+/// The credit-mode spend figure the tray shows: billed dollars since the
+/// balance was stamped. `None` unless the plan is credit, a balance is on
+/// file, and its timestamp parses — without the stamp there is no honest
+/// window to sum over.
+fn credit_spend(path: &PathBuf, config: &config::Config) -> Option<f64> {
+    if config.plan != config::Plan::Credit || config.balance.is_none() {
+        return None;
+    }
+    spend_since(path, config.balance_time()?.timestamp_millis())
+}
+
 /// "812", "34.5K", "1.2M" — keeps the hover tooltip to one short line.
 fn format_tokens(n: u64) -> String {
     match n {
@@ -318,6 +358,20 @@ fn level_for(count: Option<u32>) -> Level {
         Some(n) if n >= RED_AT => Level::Red,
         Some(n) if n >= YELLOW_AT => Level::Yellow,
         Some(_) => Level::Green,
+    }
+}
+
+/// Credit-mode light: what is left of the entered balance, judged against
+/// the configured percentages of that balance. At or below the red
+/// percentage is red; at or below yellow is yellow.
+fn credit_level(balance: f64, spend: f64, yellow_percent: f64, red_percent: f64) -> Level {
+    let remaining = balance - spend;
+    if remaining <= balance * red_percent / 100.0 {
+        Level::Red
+    } else if remaining <= balance * yellow_percent / 100.0 {
+        Level::Yellow
+    } else {
+        Level::Green
     }
 }
 
@@ -401,6 +455,7 @@ struct UsageTray {
     last_hour: Option<u32>,
     tokens: Option<u64>,
     recent: Option<Vec<stats::DayStats>>,
+    spend: Option<f64>,
     running: bool,
     working: bool,
     frame: u8,
@@ -424,6 +479,7 @@ impl UsageTray {
         self.last_hour = count_last_hour(&self.path);
         self.tokens = tokens_today(&self.path);
         self.recent = stats::collect(&self.path, 3);
+        self.spend = credit_spend(&self.path, &self.config);
         self.running = opencode_running(); // <- new
         // A run can't be in flight if OpenCode isn't running. Gating here also
         // covers a session OpenCode left unfinished (killed mid-run) instead
@@ -431,7 +487,35 @@ impl UsageTray {
         self.working = self.running && session_working(&self.path);
     }
     fn level(&self) -> Level {
-        level_for(self.count)
+        match self.config.plan {
+            config::Plan::Credit => match (self.config.balance, self.spend) {
+                (Some(balance), Some(spend)) => credit_level(
+                    balance,
+                    spend,
+                    self.config.yellow_percent,
+                    self.config.red_percent,
+                ),
+                // No usable balance on file: judge by the free counts,
+                // the only honest signal left.
+                _ => level_for(self.count),
+            },
+            _ => level_for(self.count),
+        }
+    }
+
+    /// The credit-mode hover line: the estimated balance left, or why
+    /// there isn't one. Only called when the plan is credit.
+    fn credit_line(&self) -> String {
+        match (self.config.balance, self.spend) {
+            (Some(balance), Some(spend)) => {
+                format!(
+                    "\n~${:.2} of ${balance:.2} Zen credit left",
+                    balance - spend
+                )
+            }
+            (Some(balance), None) => format!("\n${balance:.2} Zen credit (spend unavailable)"),
+            _ => "\nZen credit balance not set".to_string(),
+        }
     }
     /// The hover text: title lines plus the reset time. Shared with `--once`
     /// so the CLI and the tray can't drift apart.
@@ -462,6 +546,9 @@ impl UsageTray {
                         ));
                     }
                     None => title.push_str("\nlast 3 days unavailable"),
+                }
+                if self.config.plan == config::Plan::Credit {
+                    title.push_str(&self.credit_line());
                 }
             }
             None => title.push_str("\nusage unavailable (database unreadable)"),
@@ -500,6 +587,33 @@ impl UsageTray {
                         }
                     }
                     None => s.push_str("\nlast 3 days unavailable"),
+                }
+                if self.config.plan == config::Plan::Credit {
+                    match (self.config.balance, self.spend) {
+                        (Some(balance), Some(spend)) => {
+                            let since = self
+                                .config
+                                .balance_as_of
+                                .as_deref()
+                                .and_then(|stamp| stamp.get(..10))
+                                .unwrap_or("?");
+                            s.push_str(&format!(
+                                "\nZen credit: ~${:.2} left of ${balance:.2} (spent ${spend:.2} since {since})",
+                                balance - spend
+                            ));
+                            s.push_str(
+                                "\n(covers this machine only; other devices are not counted)",
+                            );
+                        }
+                        (Some(balance), None) => {
+                            s.push_str(&format!(
+                                "\nZen credit: ${balance:.2} on file, spend unavailable"
+                            ));
+                        }
+                        _ => s.push_str(
+                            "\nZen credit balance not set — use Configure, or: opencode-usage-tracker config balance <amount>",
+                        ),
+                    }
                 }
                 s
             }
@@ -788,6 +902,67 @@ fn report_problem(message: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Balance reminder (credit mode)
+// ---------------------------------------------------------------------------
+
+/// Is the balance on file stale for reminder purposes: never set, set
+/// without a usable timestamp, or stamped before today (UTC)? Pure, so
+/// the rule is testable off the tray.
+fn balance_stale(config: &config::Config, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if config.balance.is_none() {
+        return true;
+    }
+    let Some(set_at) = config.balance_time() else {
+        return true;
+    };
+    set_at.timestamp_millis() < utc_day_start_ms(now.timestamp_millis())
+}
+
+/// Fire the balance reminder, if the config calls for it: credit plan,
+/// reminder not silenced, balance stale. Called on the OpenCode launch
+/// transition; the checks are cheap and the notification itself is
+/// spawned onto the runtime, so the poll loop never waits on it.
+fn maybe_remind_balance(config_path: &Path) {
+    let config = config::load_or_default(config_path);
+    if config.plan != config::Plan::Credit || !config.balance_reminder {
+        return;
+    }
+    if !balance_stale(&config, chrono::Utc::now()) {
+        return;
+    }
+    let path = config_path.to_path_buf();
+    tokio::spawn(async move {
+        balance_reminder(path).await;
+    });
+}
+
+/// Show the reminder notification and wait, briefly, for its action.
+/// The "Set balance…" button runs the same dialog flow as the tray menu;
+/// closing or ignoring the notification just ends the wait.
+async fn balance_reminder(config_path: PathBuf) {
+    let shown = notify_rust::Notification::new()
+        .summary("Zen balance may be out of date")
+        .body("Set your current Zen balance for accurate tracking, or run:\nopencode-usage-tracker config balance <amount>")
+        .action("set-balance", "Set balance…")
+        .show_async()
+        .await;
+    let Ok(handle) = shown else {
+        return;
+    };
+    let wait = handle.wait_for_action_async(|response| {
+        if let notify_rust::NotificationResponse::Action(action) = response
+            && action.as_str() == "set-balance"
+        {
+            let path = config_path.clone();
+            std::thread::spawn(move || prompt_set_balance_flow(&path));
+        }
+    });
+    // An ignored reminder must not hold the notification open forever:
+    // when the timeout passes, the wait is dropped and so is the handle.
+    let _ = tokio::time::timeout(Duration::from_secs(300), wait).await;
+}
+
+// ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
 
@@ -906,6 +1081,7 @@ async fn main() {
             last_hour: None,
             tokens: None,
             recent: None,
+            spend: None,
             running: false,
             working: false,
             frame: 0,
@@ -929,6 +1105,7 @@ async fn main() {
         last_hour: None,
         tokens: None,
         recent: None,
+        spend: None,
         running: false,
         working: false,
         frame: 0,
@@ -938,6 +1115,7 @@ async fn main() {
     };
     tray.refresh(); // first paint should already be right
     let mut working = tray.working;
+    let mut was_running = tray.running;
     let handle = match tray.spawn().await {
         Ok(h) => h,
         Err(e) => {
@@ -958,7 +1136,14 @@ async fn main() {
         if ticks.is_multiple_of(4) {
             // 1s cadence. The /proc scan is cheap, and gating on it clears
             // `working` when OpenCode isn't running (e.g. killed mid-run).
-            working = opencode_running() && session_working(&path);
+            let running_now = opencode_running();
+            // The launch transition is the balance reminder's trigger:
+            // OpenCode just started, so spending is about to happen.
+            if running_now && !was_running {
+                maybe_remind_balance(&config_path);
+            }
+            was_running = running_now;
+            working = running_now && session_working(&path);
         }
 
         if ticks.is_multiple_of(TICKS_PER_POLL) {
@@ -982,6 +1167,7 @@ async fn main() {
                     if config::modified_ms(&tray.config_path).unwrap_or(0) != tray.config_mtime {
                         tray.reload_config();
                     }
+                    tray.spend = credit_spend(&tray.path, &tray.config);
                 })
                 .await;
             continue;
@@ -1032,6 +1218,7 @@ mod tests {
                     tokens: 3_000,
                 },
             ]),
+            spend: None,
             running,
             working: false,
             frame: 0,
@@ -1066,6 +1253,46 @@ mod tests {
         t.recent = None;
         assert!(t.hover().title.contains("\nlast 3 days unavailable"));
         assert!(t.summary().contains("\nlast 3 days unavailable"));
+    }
+
+    #[test]
+    fn credit_level_follows_the_configured_percentages() {
+        // $100 balance, yellow at 25% left, red at 10% left.
+        assert!(credit_level(100.0, 50.0, 25.0, 10.0) == Level::Green);
+        assert!(credit_level(100.0, 75.0, 25.0, 10.0) == Level::Yellow);
+        assert!(credit_level(100.0, 90.0, 25.0, 10.0) == Level::Red);
+        assert!(credit_level(100.0, 120.0, 25.0, 10.0) == Level::Red);
+    }
+
+    #[test]
+    fn credit_plan_shows_the_estimated_balance() {
+        let mut t = tray(Some(12), true);
+        t.config.plan = config::Plan::Credit;
+        t.config.balance = Some(25.0);
+        t.config.balance_as_of = Some("2026-10-29T05:42:05Z".to_string());
+        t.spend = Some(5.0);
+        assert!(
+            t.hover()
+                .title
+                .contains("\n~$20.00 of $25.00 Zen credit left")
+        );
+        let summary = t.summary();
+        assert!(
+            summary.contains("Zen credit: ~$20.00 left of $25.00 (spent $5.00 since 2026-10-29)")
+        );
+        assert!(summary.contains("covers this machine only"));
+        assert!(t.level() == Level::Green);
+        t.spend = Some(24.0);
+        assert!(t.level() == Level::Red);
+    }
+
+    #[test]
+    fn credit_plan_without_a_balance_says_so() {
+        let mut t = tray(Some(12), true);
+        t.config.plan = config::Plan::Credit;
+        assert!(t.hover().title.contains("\nZen credit balance not set"));
+        // No balance to judge by: the free counts drive the light.
+        assert!(t.level() == Level::Green);
     }
 
     #[test]
@@ -1117,6 +1344,26 @@ mod tests {
         assert!(!is_balance_amount("-1"));
         assert!(!is_balance_amount("abc"));
         assert!(!is_balance_amount("NaN"));
+    }
+
+    #[test]
+    fn balance_staleness_rules() {
+        let now = chrono::Utc::now();
+        let mut config = config::Config::default();
+        config.plan = config::Plan::Credit;
+        // Never set: stale.
+        assert!(balance_stale(&config, now));
+        // Stamped just now: fresh.
+        config.balance = Some(25.0);
+        config.balance_as_of = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        assert!(!balance_stale(&config, now));
+        // Stamped two days ago: stale.
+        let old = now - chrono::Duration::days(2);
+        config.balance_as_of = Some(old.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        assert!(balance_stale(&config, now));
+        // A stamp that does not parse: stale.
+        config.balance_as_of = Some("not a timestamp".to_string());
+        assert!(balance_stale(&config, now));
     }
 
     /// Build the two tables `working_from` touches and seed one newest session.

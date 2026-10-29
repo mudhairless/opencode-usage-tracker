@@ -154,8 +154,6 @@ impl Default for Config {
 
 impl Config {
     /// `balance_as_of` as a real timestamp, or `None` when unset or malformed.
-    /// Nothing reads it yet; the paid-model features will.
-    #[allow(dead_code)]
     pub fn balance_time(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
         chrono::DateTime::parse_from_rfc3339(self.balance_as_of.as_deref()?).ok()
     }
@@ -366,10 +364,10 @@ fn ensure_file(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, TEMPLATE)?;
     Ok(())
@@ -394,10 +392,10 @@ fn from_doc(doc: &DocumentMut) -> Config {
     {
         cfg.go_tier = tier;
     }
-    if let Some(balance) = doc.get("balance").and_then(number) {
-        if balance >= 0.0 {
-            cfg.balance = Some(balance);
-        }
+    if let Some(balance) = doc.get("balance").and_then(number)
+        && balance >= 0.0
+    {
+        cfg.balance = Some(balance);
     }
     if let Some(item) = doc.get("balance_as_of") {
         // Native TOML datetimes are what this build writes; quoted RFC 3339
@@ -411,15 +409,17 @@ fn from_doc(doc: &DocumentMut) -> Config {
     if let Some(on) = doc.get("balance_reminder").and_then(|i| i.as_bool()) {
         cfg.balance_reminder = on;
     }
-    if let Some(percent) = doc.get("yellow_percent").and_then(number) {
-        if percent > 0.0 && percent <= 100.0 {
-            cfg.yellow_percent = percent;
-        }
+    if let Some(percent) = doc.get("yellow_percent").and_then(number)
+        && percent > 0.0
+        && percent <= 100.0
+    {
+        cfg.yellow_percent = percent;
     }
-    if let Some(percent) = doc.get("red_percent").and_then(number) {
-        if percent > 0.0 && percent <= 100.0 {
-            cfg.red_percent = percent;
-        }
+    if let Some(percent) = doc.get("red_percent").and_then(number)
+        && percent > 0.0
+        && percent <= 100.0
+    {
+        cfg.red_percent = percent;
     }
 
     cfg
