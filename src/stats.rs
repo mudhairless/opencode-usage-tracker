@@ -11,10 +11,12 @@
 //!
 //! Below the chart sits the composable query engine (Phase 4): one query —
 //! range, grouping, field selection, filters — evaluated into a single
-//! row structure that both the JSON output and the text table render, so
-//! the two can never disagree. Rows classify three ways: `zen-free` (the
-//! shared free pool), `billed` (recorded cost above zero), and `other`
-//! (local providers, third-party zero-cost rows, unknown models).
+//! row structure that the chart, the JSON output, and the text table all
+//! render, so the three can never disagree. The chart is the default
+//! rendering; `--json` writes the report for other tools, and `--text`
+//! prints the table. Rows classify three ways: `zen-free` (the shared
+//! free pool), `billed` (recorded cost above zero), and `other` (local
+//! providers, third-party zero-cost rows, unknown models).
 
 use std::io;
 use std::path::PathBuf;
@@ -40,7 +42,12 @@ const JSON_DAYS: u32 = 7;
 /// How many days fit across `width` columns at the fixed bar width: each day
 /// takes `BAR_WIDTH` plus the gap after it, except the last bar's gap.
 fn fit_days(width: u16) -> u32 {
-    let per_day = BAR_WIDTH + BAR_GAP;
+    fit_count(width, BAR_WIDTH)
+}
+
+/// How many bars of `bar_width` fit across `width` columns, gaps included.
+fn fit_count(width: u16, bar_width: u16) -> u32 {
+    let per_day = bar_width + BAR_GAP;
     (width.saturating_add(BAR_GAP) / per_day).max(1).into()
 }
 
@@ -85,12 +92,6 @@ pub fn collect(path: &PathBuf, days: u32) -> Option<Vec<DayStats>> {
         out.push(stats);
     }
     Some(out)
-}
-
-fn total(stats: &[DayStats]) -> (u32, u64) {
-    stats
-        .iter()
-        .fold((0, 0), |(r, t), d| (r + d.requests, t + d.tokens))
 }
 
 /// Like the tray's `format_tokens`, but two decimals, so neighbouring bars
@@ -661,6 +662,7 @@ pub fn render_table(report: &Report, query: &Query) -> String {
 }
 
 /// The `stats` options as the CLI hands them over, before validation.
+#[derive(Clone)]
 pub struct StatsOptions {
     pub days: Option<u32>,
     pub from: Option<String>,
@@ -670,21 +672,8 @@ pub struct StatsOptions {
     pub model: Option<String>,
     pub paid: bool,
     pub free: bool,
+    pub text: bool,
     pub json: bool,
-}
-
-impl StatsOptions {
-    /// True when any composable option is set; the report then renders
-    /// as a table (or JSON), never as the interactive chart.
-    pub fn is_query(&self) -> bool {
-        self.from.is_some()
-            || self.to.is_some()
-            || self.by.is_some()
-            || self.fields.is_some()
-            || self.model.is_some()
-            || self.paid
-            || self.free
-    }
 }
 
 /// Validate the CLI options into a query. Range defaults: `--days`
@@ -740,8 +729,9 @@ pub fn build_query(opts: &StatsOptions) -> Result<Query, String> {
     })
 }
 
-/// Run a composable stats query: JSON with `--json`, the text table
-/// otherwise.
+/// Run a composable stats query to the console: JSON with `--json`,
+/// the text table with `--text`. Any other invocation renders the
+/// chart instead (see `run`).
 pub fn run_query(path: &PathBuf, opts: &StatsOptions) -> anyhow::Result<()> {
     let query = build_query(opts).map_err(anyhow::Error::msg)?;
     let Some(report) = collect_report(path, &query) else {
@@ -758,9 +748,158 @@ pub fn run_query(path: &PathBuf, opts: &StatsOptions) -> anyhow::Result<()> {
 /// The interactive chart: as many days as bars fit across the terminal, or
 /// `--days` of them. Arrow keys slide the window a day at a time when the
 /// report holds more days than fit. `q` / Esc quits.
-fn run_chart(path: &PathBuf, days: Option<u32>) -> io::Result<()> {
+/// One chartable metric of a report row. The chart cycles through the
+/// metrics the query's field selection carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Metric {
+    Tokens,
+    Requests,
+    Cost,
+    Input,
+    Output,
+    Reasoning,
+    CacheRead,
+    CacheWrite,
+}
+
+impl Metric {
+    fn name(self) -> &'static str {
+        match self {
+            Metric::Tokens => "tokens",
+            Metric::Requests => "requests",
+            Metric::Cost => "cost",
+            Metric::Input => "input",
+            Metric::Output => "output",
+            Metric::Reasoning => "reasoning",
+            Metric::CacheRead => "cache-read",
+            Metric::CacheWrite => "cache-write",
+        }
+    }
+
+    fn raw(self, m: &Metrics) -> f64 {
+        match self {
+            Metric::Tokens => m.tokens() as f64,
+            Metric::Requests => m.requests as f64,
+            Metric::Cost => m.cost,
+            Metric::Input => m.input as f64,
+            Metric::Output => m.output as f64,
+            Metric::Reasoning => m.reasoning as f64,
+            Metric::CacheRead => m.cache_read as f64,
+            Metric::CacheWrite => m.cache_write as f64,
+        }
+    }
+
+    /// Bar heights are integers: dollars become cents, everything else
+    /// is already a count.
+    fn bar_value(self, m: &Metrics) -> u64 {
+        match self {
+            Metric::Cost => (m.cost * 100.0).round().max(0.0) as u64,
+            _ => self.raw(m) as u64,
+        }
+    }
+
+    /// The value as it prints on a bar or in the header.
+    fn text(self, m: &Metrics) -> String {
+        match self {
+            Metric::Tokens => format_precise_tokens(m.tokens()),
+            Metric::Cost => format!("${:.2}", m.cost),
+            _ => format!("{}", self.raw(m) as u64),
+        }
+    }
+
+    fn y_label(self, v: f64) -> String {
+        match self {
+            Metric::Tokens => format_tokens(v as u64),
+            Metric::Cost => format!("${v:.2}"),
+            _ => format!("{v:.0}"),
+        }
+    }
+
+    /// Fill color, and the color of the count printed on the fill: the
+    /// count must read against the fill, so dark fills take white text
+    /// and light fills take black.
+    fn styles(self) -> (Style, Style) {
+        match self {
+            // Calm blue rather than the glaring green.
+            Metric::Tokens => (Style::default().blue(), Style::default().white()),
+            Metric::Requests => (Style::default().green(), Style::default().black()),
+            Metric::Cost => (Style::default().yellow(), Style::default().black()),
+            _ => (Style::default().cyan(), Style::default().black()),
+        }
+    }
+}
+
+/// The metrics a query puts on the chart's Tab cycle. The token
+/// buckets ride along with the tokens total rather than cycling
+/// individually; selected on their own, they cycle one by one. Cost
+/// is skipped for the free pool, whose rows are zero-cost by
+/// definition — an all-zero chart would say nothing.
+fn metrics_for(query: &Query) -> Vec<Metric> {
+    let fields = &query.fields;
+    let mut out = Vec::new();
+    if fields.tokens {
+        out.push(Metric::Tokens);
+    }
+    if fields.requests {
+        out.push(Metric::Requests);
+    }
+    if fields.cost && query.category != Some(Category::ZenFree) {
+        out.push(Metric::Cost);
+    }
+    if !fields.tokens {
+        if fields.input {
+            out.push(Metric::Input);
+        }
+        if fields.output {
+            out.push(Metric::Output);
+        }
+        if fields.reasoning {
+            out.push(Metric::Reasoning);
+        }
+        if fields.cache_read {
+            out.push(Metric::CacheRead);
+        }
+        if fields.cache_write {
+            out.push(Metric::CacheWrite);
+        }
+    }
+    if out.is_empty() {
+        out.push(Metric::Requests);
+    }
+    out
+}
+
+/// A row's chart label: its grouping keys in order, the day shortened
+/// to month and day.
+fn row_label(row: &ReportRow) -> String {
+    let mut parts = Vec::new();
+    if let Some(date) = &row.date {
+        parts.push(date[5..].to_string());
+    }
+    if let Some(model) = &row.model {
+        parts.push(model.clone());
+    }
+    if let Some(category) = row.category {
+        parts.push(category.as_str().to_string());
+    }
+    if parts.is_empty() {
+        "total".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// The bar width a report needs: the fixed width, or wide enough for
+/// the longest row label (model names are long), capped so one bar
+/// cannot eat the screen.
+fn bar_width_for(rows: &[ReportRow]) -> u16 {
+    let longest = rows.iter().map(|r| row_label(r).len()).max().unwrap_or(0) as u16;
+    longest.clamp(BAR_WIDTH, 24)
+}
+
+fn run_chart(path: &PathBuf, opts: &StatsOptions) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = chart_loop(&mut terminal, path, days);
+    let result = chart_loop(&mut terminal, path, opts);
     ratatui::restore();
     result
 }
@@ -768,26 +907,55 @@ fn run_chart(path: &PathBuf, days: Option<u32>) -> io::Result<()> {
 fn chart_loop(
     terminal: &mut ratatui::DefaultTerminal,
     path: &PathBuf,
-    days: Option<u32>,
+    opts: &StatsOptions,
 ) -> io::Result<()> {
-    let load = |width: u16| collect(path, days.unwrap_or_else(|| fit_days(width)));
-    let mut stats = load(screen_width(terminal))
+    // With no pinned range the day count follows the terminal width, as
+    // the chart has always done; --days or --from/--to pins it.
+    let pinned = opts.days.is_some() || opts.from.is_some() || opts.to.is_some();
+    let load = |width: u16| -> Option<(Report, Vec<Metric>)> {
+        let mut o = opts.clone();
+        if !pinned {
+            o.days = Some(fit_days(width));
+        }
+        let query = build_query(&o).ok()?;
+        let report = collect_report(path, &query)?;
+        let metrics = metrics_for(&query);
+        Some((report, metrics))
+    };
+    let (mut report, mut metrics) = load(screen_width(terminal))
         .ok_or_else(|| io::Error::other(format!("could not read {}", path.display())))?;
-    let mut window_start = 0usize; // oldest visible day
-    let mut mode = 0; // 0 tokens, 1 requests
+    let mut window_start = 0usize; // first visible row
+    let mut metric_idx = 0usize;
     let mut bars = true; // true bar chart, false line chart
     loop {
-        // More days loaded than fit on screen: show one screenful and let the
-        // arrow keys slide it.
-        let max_visible = stats.len().min(fit_days(screen_width(terminal)) as usize);
-        window_start = window_start.min(stats.len() - max_visible);
-        terminal.draw(|frame| draw(frame, &stats, window_start, max_visible, mode, bars))?;
+        // More rows loaded than fit on screen: show one screenful and
+        // let the arrow keys slide it.
+        let bar_width = bar_width_for(&report.rows);
+        let max_visible = report
+            .rows
+            .len()
+            .min(fit_count(screen_width(terminal), bar_width) as usize);
+        window_start = window_start.min(report.rows.len().saturating_sub(max_visible));
+        let metric = metrics[metric_idx % metrics.len()];
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                &report,
+                window_start,
+                max_visible,
+                metric,
+                bars,
+                bar_width,
+            )
+        })?;
         match event::read()? {
-            // Re-fit on resize, so the bars keep filling the terminal, unless
-            // --days pinned the count.
-            Event::Resize(width, _) if days.is_none() => {
-                if let Some(fresh) = load(width) {
-                    stats = fresh;
+            // Re-fit on resize, so the bars keep filling the terminal,
+            // unless the range pinned the count.
+            Event::Resize(width, _) if !pinned => {
+                if let Some((fresh, fresh_metrics)) = load(width) {
+                    report = fresh;
+                    metrics = fresh_metrics;
+                    metric_idx = metric_idx.min(metrics.len() - 1);
                 }
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
@@ -796,9 +964,10 @@ fn chart_loop(
                     window_start = window_start.saturating_sub(1);
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
-                    window_start = (window_start + 1).min(stats.len() - max_visible);
+                    window_start =
+                        (window_start + 1).min(report.rows.len().saturating_sub(max_visible));
                 }
-                KeyCode::Tab => mode = 1 - mode,
+                KeyCode::Tab => metric_idx = (metric_idx + 1) % metrics.len(),
                 KeyCode::Char('b') => bars = !bars,
                 _ => {}
             },
@@ -813,31 +982,35 @@ fn screen_width(terminal: &ratatui::DefaultTerminal) -> u16 {
 
 fn draw(
     frame: &mut Frame,
-    stats: &[DayStats],
+    report: &Report,
     window_start: usize,
     max_visible: usize,
-    mode: usize,
+    metric: Metric,
     bars: bool,
+    bar_width: u16,
 ) {
-    let visible = &stats[window_start..window_start + max_visible];
-    let (requests, tokens) = total(visible);
+    let visible = &report.rows[window_start..window_start + max_visible];
     let span = if visible.len() > 1 {
         format!(
             "{} … {}",
-            visible.first().unwrap().date,
-            visible.last().unwrap().date
+            row_label(visible.first().unwrap()),
+            row_label(visible.last().unwrap())
         )
     } else {
         visible
             .first()
-            .map_or_else(|| "?".to_string(), |d| d.date.clone())
+            .map_or_else(|| "no rows in range".to_string(), row_label)
     };
+    let mut summed = Metrics::default();
+    for row in visible {
+        summed.add(&row.metrics);
+    }
 
     let header = format!(
-        "OpenCode Zen free-tier usage   {span}\n\
-         {} requests   {} tokens   ←/→ slide window   Tab metric   b bars/line   q quit",
-        format_tokens(requests as u64),
-        format_tokens(tokens),
+        "OpenCode usage   {span}\n\
+         {} {}   ←/→ slide window   Tab metric   b bars/line   q quit",
+        metric.text(&summed),
+        metric.name(),
     );
 
     let area = frame.area();
@@ -854,73 +1027,47 @@ fn draw(
         chunks[0],
     );
 
-    let labels: Vec<String> = visible.iter().map(|d| d.date[5..].to_string()).collect();
-    let values: Vec<u64> = visible
-        .iter()
-        .map(|d| {
-            if mode == 0 {
-                d.tokens
-            } else {
-                d.requests as u64
-            }
-        })
-        .collect();
+    if visible.is_empty() {
+        return;
+    }
+
+    let labels: Vec<String> = visible.iter().map(row_label).collect();
     // The bar chart has no dataset names of its own, so both chart styles
     // pair a fill color with the name to label it with.
-    let (color, name) = if mode == 0 {
-        // Calm blue rather than the glaring green.
-        (Style::default().blue(), "tokens/day")
-    } else {
-        (Style::default().green(), "requests/day")
-    };
-    // The count prints on the fill, so it must read against that color:
-    // white sinks into nothing on the light cyan, black on the dark blue.
-    let value_style = if mode == 0 {
-        Style::default().white()
-    } else {
-        Style::default().black()
-    };
+    let (color, value_style) = metric.styles();
+    let name = metric.name();
 
     if bars {
-        // Tokens print like "47.21M"; request counts are small enough to
-        // print whole.
-        let texts: Vec<String> = if mode == 0 {
-            values.iter().map(|v| format_precise_tokens(*v)).collect()
-        } else {
-            values.iter().map(ToString::to_string).collect()
-        };
-        render_bars(
-            frame,
-            chunks[1],
-            &values,
-            &texts,
-            &labels,
-            color,
-            value_style,
-        );
+        let columns: Vec<Bar> = visible
+            .iter()
+            .map(|r| {
+                Bar::new(metric.bar_value(&r.metrics))
+                    .label(row_label(r))
+                    .text_value(metric.text(&r.metrics))
+                    .style(color)
+            })
+            .collect();
+        render_bars(frame, chunks[1], &columns, value_style, bar_width);
         // Same corner, same box as the line chart's legend.
         render_bar_legend(frame, chunks[1], name, color);
         return;
     }
 
+    let values: Vec<f64> = visible.iter().map(|r| metric.raw(&r.metrics)).collect();
     let points: Vec<(f64, f64)> = values
         .iter()
         .enumerate()
-        .map(|(i, v)| (i as f64, *v as f64))
+        .map(|(i, v)| (i as f64, *v))
         .collect();
-    let max = values.iter().copied().max().unwrap_or(1).max(1) as f64;
-    let min = values.iter().copied().min().unwrap_or(0) as f64;
+    let max = values
+        .iter()
+        .copied()
+        .reduce(f64::max)
+        .unwrap_or(1.0)
+        .max(1.0);
+    let min = values.iter().copied().reduce(f64::min).unwrap_or(0.0);
     let y0 = if min == 0.0 { 0.0 } else { min * 0.85 };
     let y1 = max * 1.15;
-    // Tokens get the tray's compact "12.3K" form; request counts are small
-    // enough to print whole.
-    let y_label = |v: f64| {
-        if mode == 0 {
-            format_tokens(v as u64)
-        } else {
-            format!("{v:.0}")
-        }
-    };
     let dataset = Dataset::default()
         .name(name)
         .marker(symbols::Marker::Braille)
@@ -939,40 +1086,26 @@ fn draw(
             .y_axis(
                 Axis::default()
                     .style(Style::default().dark_gray())
-                    .labels(vec![y_label(y0), y_label(y1)])
+                    .labels(vec![metric.y_label(y0), metric.y_label(y1)])
                     .bounds([y0, y1]),
             ),
         chunks[1],
     );
 }
 
-/// The bar chart: one bar per day at the fixed `BAR_WIDTH`, separated by a
-/// single empty column, with the day's count printed at the bar's base as
-/// `texts` says it.
+/// The bar chart: the given bars at `bar_width`, separated by a single
+/// empty column.
 fn render_bars(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
-    values: &[u64],
-    texts: &[String],
-    labels: &[String],
-    color: Style,
+    columns: &[Bar<'_>],
     value_style: Style,
+    bar_width: u16,
 ) {
-    let columns: Vec<Bar<'_>> = values
-        .iter()
-        .zip(texts.iter())
-        .zip(labels.iter())
-        .map(|((value, text), label)| {
-            Bar::new(*value)
-                .label(label.as_str())
-                .text_value(text.clone())
-                .style(color)
-        })
-        .collect();
     frame.render_widget(
         BarChart::default()
-            .data(BarGroup::default().bars(&columns))
-            .bar_width(BAR_WIDTH.min(area.width))
+            .data(BarGroup::default().bars(columns))
+            .bar_width(bar_width.min(area.width))
             .bar_gap(BAR_GAP)
             .value_style(value_style)
             .label_style(Style::default().dark_gray()),
@@ -1002,9 +1135,10 @@ fn render_bar_legend(frame: &mut Frame, area: ratatui::layout::Rect, name: &str,
         rect,
     );
 }
-pub fn run(path: &PathBuf, days: Option<u32>) -> anyhow::Result<()> {
-    // The chart sizes its own day count to the terminal when --days is off.
-    run_chart(path, days)?;
+pub fn run(path: &PathBuf, opts: &StatsOptions) -> anyhow::Result<()> {
+    // Every query renders as the chart; --json and --text go through
+    // run_query instead and never reach here.
+    run_chart(path, opts)?;
     Ok(())
 }
 
@@ -1292,6 +1426,7 @@ mod tests {
             model: None,
             paid: false,
             free: false,
+            text: false,
             json: false,
         };
         let both_filters = StatsOptions {
@@ -1309,6 +1444,7 @@ mod tests {
             model: None,
             paid: false,
             free: false,
+            text: false,
             json: false,
         };
         let mixed_range = StatsOptions {
@@ -1317,6 +1453,47 @@ mod tests {
             ..blank
         };
         assert!(build_query(&mixed_range).is_err());
+    }
+
+    #[test]
+    fn chart_metric_cycle_follows_fields() {
+        let mut q = query(0, 0);
+        assert_eq!(
+            metrics_for(&q),
+            vec![Metric::Tokens, Metric::Requests, Metric::Cost]
+        );
+        q.fields = parse_fields("cost").unwrap();
+        assert_eq!(metrics_for(&q), vec![Metric::Cost]);
+        q.fields = parse_fields("input").unwrap();
+        assert_eq!(metrics_for(&q), vec![Metric::Input]);
+        // `tokens` selected: the buckets ride along with the total
+        // rather than cycling one by one.
+        q.fields = parse_fields("tokens").unwrap();
+        assert_eq!(metrics_for(&q), vec![Metric::Tokens]);
+        // The free pool is zero-cost by definition: no cost chart.
+        q.fields = Fields::all();
+        q.category = Some(Category::ZenFree);
+        assert_eq!(metrics_for(&q), vec![Metric::Tokens, Metric::Requests]);
+    }
+
+    #[test]
+    fn chart_labels_and_cost_scaling() {
+        let row = ReportRow {
+            date: Some("2026-10-20".to_string()),
+            model: None,
+            category: Some(Category::Billed),
+            metrics: Metrics {
+                cost: 1.75,
+                ..Metrics::default()
+            },
+        };
+        assert_eq!(row_label(&row), "10-20 billed");
+        // Bars are integer heights: dollars are charted as cents.
+        assert_eq!(Metric::Cost.bar_value(&row.metrics), 175);
+        assert_eq!(Metric::Cost.text(&row.metrics), "$1.75");
+        // Bars widen to fit their labels, capped at 24 columns.
+        assert_eq!(bar_width_for(std::slice::from_ref(&row)), 12);
+        assert_eq!(fit_count(100, 17), 5);
     }
 
     /// `fit_days` decides how many bars fill the terminal: 8 columns each

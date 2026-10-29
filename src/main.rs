@@ -1079,10 +1079,11 @@ enum Command {
         system: bool,
     },
 
-    /// Show historical usage: the interactive chart for a plain run, a
-    /// table when any composable option is given, or JSON with --json.
-    /// The chart fits as many days as bars fit on screen; the arrow keys
-    /// slide the window when more days are loaded than fit.
+    /// Show historical usage: any query renders as the interactive
+    /// chart, except --json (machine-readable output for other tools)
+    /// and --text (a plain table). The chart fits as many bars as fit
+    /// on screen; the arrow keys slide the window when more rows are
+    /// loaded than fit, and Tab cycles the metric.
     Stats {
         /// How many days back to report (1 or more). Defaults to the most
         /// days whose bars fit on screen (7 with --json or a table)
@@ -1119,6 +1120,10 @@ enum Command {
         /// Only free-pool usage (Zen free models)
         #[arg(long)]
         free: bool,
+
+        /// Print the report as a text table instead of the chart
+        #[arg(long)]
+        text: bool,
 
         /// Print JSON (rows plus totals) instead of the chart or table
         #[arg(long)]
@@ -1168,6 +1173,7 @@ async fn main() {
                 model,
                 paid,
                 free,
+                text,
                 json,
             } => {
                 let opts = stats::StatsOptions {
@@ -1179,12 +1185,13 @@ async fn main() {
                     model: model.clone(),
                     paid: *paid,
                     free: *free,
+                    text: *text,
                     json: *json,
                 };
-                if opts.json || opts.is_query() {
+                if opts.json || opts.text {
                     stats::run_query(&db_path(), &opts)
                 } else {
-                    stats::run(&db_path(), *days)
+                    stats::run(&db_path(), &opts)
                 }
             }
             Command::Config {
