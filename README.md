@@ -2,20 +2,24 @@
 
 [![Rust](https://github.com/mudhairless/opencode-usage-tracker/actions/workflows/rust.yml/badge.svg)](https://github.com/mudhairless/opencode-usage-tracker/actions/workflows/rust.yml)
 
-A KDE Plasma tray icon that shows how many OpenCode Zen free-tier requests you have made today. It reads OpenCode's local SQLite database every 30 seconds and colors the icon to match:
+A KDE Plasma and GNOME tray icon that tracks your OpenCode usage. By default it counts today's OpenCode Zen free-tier requests; it can also follow a Zen credit balance or an OpenCode Go subscription (see [Paid plans](#paid-plans)). It reads OpenCode's local SQLite database every 30 seconds and colors the icon to match.
+
+On the default free plan, the color follows today's free-tier requests:
 
 | Icon color | Requests today |
 | --- | --- |
-| Green | fewer than 400 |
-| Yellow | 400 to 499 |
-| Red | 500 or more |
+| Green | fewer than 100 |
+| Yellow | 100 to 149 |
+| Red | 150 or more |
 | Gray | the database could not be read |
+
+On the paid plans the light follows that plan's own resource instead: the estimated credit balance left, or how much of a Go model's tightest window limit is used.
 
 The Zen day resets at 00:00 UTC. The tooltip and the tray menu show the reset time in your local timezone.
 
 The tracker runs no INSERT, UPDATE, or DELETE statements, and it makes no network requests. Every number comes from the local OpenCode database.
 
-The `stats` subcommand charts the same counts per UTC day in the terminal.
+The `stats` subcommand charts usage in the terminal: per UTC day, per model, or both, with token and cost breakdowns.
 
 ## Requirements
 
