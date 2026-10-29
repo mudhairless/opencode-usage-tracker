@@ -1043,7 +1043,7 @@ async fn balance_reminder(config_path: PathBuf) {
 #[command(
     version,
     about = "KDE tray traffic light for OpenCode Zen free-tier usage",
-    after_help = "examples:\n  opencode-usage-tracker                      run the tray\n  opencode-usage-tracker --once               print the hover text and exit\n  opencode-usage-tracker install              install for you\n  opencode-usage-tracker install --system --autostart\n  opencode-usage-tracker uninstall            remove the install\n  opencode-usage-tracker config --list          show every key and value\n  opencode-usage-tracker config balance 25.00   set a value"
+    after_help = "examples:\n  opencode-usage-tracker                      run the tray\n  opencode-usage-tracker --once               print the hover text and exit\n  opencode-usage-tracker install              install for you\n  opencode-usage-tracker install --system --autostart\n  opencode-usage-tracker uninstall            remove the install\n  opencode-usage-tracker config --list          show every key and value\n  opencode-usage-tracker config balance 25.00   set a value\n  opencode-usage-tracker stats --by model --paid   billed models, last week"
 )]
 struct Cli {
     /// Print the tray's hover text once and exit
@@ -1079,16 +1079,48 @@ enum Command {
         system: bool,
     },
 
-    /// Show historical free-tier usage per UTC day: a terminal chart, or
-    /// JSON with --json. The chart fits as many days as bars fit on screen;
-    /// the arrow keys slide the window when more days are loaded than fit.
+    /// Show historical usage: the interactive chart for a plain run, a
+    /// table when any composable option is given, or JSON with --json.
+    /// The chart fits as many days as bars fit on screen; the arrow keys
+    /// slide the window when more days are loaded than fit.
     Stats {
         /// How many days back to report (1 or more). Defaults to the most
-        /// days whose bars fit on screen (7 with --json)
+        /// days whose bars fit on screen (7 with --json or a table)
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=365))]
         days: Option<u32>,
 
-        /// Print JSON (per-day rows plus totals) instead of the chart
+        /// Start of the range as a UTC date (YYYY-MM-DD); combine with
+        /// --to, and not with --days
+        #[arg(long)]
+        from: Option<String>,
+
+        /// End of the range as a UTC date (YYYY-MM-DD, inclusive)
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Group rows by day, model, day,model, or model,day
+        /// (default: day)
+        #[arg(long)]
+        by: Option<String>,
+
+        /// Metric columns to show: requests, tokens, input, output,
+        /// reasoning, cache-read, cache-write, cost (default: all)
+        #[arg(long)]
+        fields: Option<String>,
+
+        /// Only this model id; * and ? act as wildcards
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Only billed usage (rows with recorded cost above zero)
+        #[arg(long)]
+        paid: bool,
+
+        /// Only free-pool usage (Zen free models)
+        #[arg(long)]
+        free: bool,
+
+        /// Print JSON (rows plus totals) instead of the chart or table
         #[arg(long)]
         json: bool,
     },
@@ -1127,7 +1159,34 @@ async fn main() {
                 from,
             } => install::install(*system, *autostart, from.as_deref()),
             Command::Uninstall { system } => install::uninstall(*system),
-            Command::Stats { days, json } => stats::run(&db_path(), *days, *json),
+            Command::Stats {
+                days,
+                from,
+                to,
+                by,
+                fields,
+                model,
+                paid,
+                free,
+                json,
+            } => {
+                let opts = stats::StatsOptions {
+                    days: *days,
+                    from: from.clone(),
+                    to: to.clone(),
+                    by: by.clone(),
+                    fields: fields.clone(),
+                    model: model.clone(),
+                    paid: *paid,
+                    free: *free,
+                    json: *json,
+                };
+                if opts.json || opts.is_query() {
+                    stats::run_query(&db_path(), &opts)
+                } else {
+                    stats::run(&db_path(), *days)
+                }
+            }
             Command::Config {
                 list,
                 edit,
