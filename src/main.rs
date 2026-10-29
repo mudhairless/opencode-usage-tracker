@@ -24,6 +24,7 @@
 
 mod config;
 mod dialog;
+mod go;
 mod install;
 mod stats;
 
@@ -41,6 +42,8 @@ const SPIN_FRAMES: u8 = 8;
 const ARC: f32 = 2.1; // radians of ring lit behind the head (~120°)
 const YELLOW_AT: u32 = 100;
 const RED_AT: u32 = 150;
+/// Go mode turns yellow at this fraction of any window's limit.
+const GO_YELLOW_RATIO: f64 = 0.8;
 const ICON_SIZE: i32 = 44;
 const THROBBER_THICKNESS: f32 = 2.4;
 const AN_HOUR_IN_MS: i64 = 3_600_000;
@@ -330,6 +333,14 @@ fn credit_spend(path: &PathBuf, config: &config::Config) -> Option<f64> {
     spend_since(path, config.balance_time()?.timestamp_millis())
 }
 
+/// The Go-mode usage the tray shows, collected only on the Go plan.
+fn go_usage(path: &PathBuf, config: &config::Config) -> Option<Vec<go::ModelUsage>> {
+    if config.plan != config::Plan::Go {
+        return None;
+    }
+    go::collect_usage(path, config.go_tier, now_ms().unwrap_or(0))
+}
+
 /// "812", "34.5K", "1.2M" — keeps the hover tooltip to one short line.
 fn format_tokens(n: u64) -> String {
     match n {
@@ -456,6 +467,7 @@ struct UsageTray {
     tokens: Option<u64>,
     recent: Option<Vec<stats::DayStats>>,
     spend: Option<f64>,
+    go: Option<Vec<go::ModelUsage>>,
     running: bool,
     working: bool,
     frame: u8,
@@ -480,6 +492,7 @@ impl UsageTray {
         self.tokens = tokens_today(&self.path);
         self.recent = stats::collect(&self.path, 3);
         self.spend = credit_spend(&self.path, &self.config);
+        self.go = go_usage(&self.path, &self.config);
         self.running = opencode_running(); // <- new
         // A run can't be in flight if OpenCode isn't running. Gating here also
         // covers a session OpenCode left unfinished (killed mid-run) instead
@@ -499,6 +512,14 @@ impl UsageTray {
                 // the only honest signal left.
                 _ => level_for(self.count),
             },
+            config::Plan::Go => match self.go.as_deref().and_then(go::worst_ratio) {
+                Some((ratio, _, _)) if ratio >= 1.0 => Level::Red,
+                Some((ratio, _, _)) if ratio >= GO_YELLOW_RATIO => Level::Yellow,
+                Some(_) => Level::Green,
+                // No priced Go usage to judge: fall back to the free
+                // counts, same as credit mode does without a balance.
+                None => level_for(self.count),
+            },
             _ => level_for(self.count),
         }
     }
@@ -515,6 +536,28 @@ impl UsageTray {
             }
             (Some(balance), None) => format!("\n${balance:.2} Zen credit (spend unavailable)"),
             _ => "\nZen credit balance not set".to_string(),
+        }
+    }
+
+    /// The Go-mode hover line: the tightest window across priced
+    /// models, or why there isn't one. Only called when the plan is Go.
+    fn go_line(&self) -> String {
+        let Some(usages) = &self.go else {
+            return "\nGo usage unavailable".to_string();
+        };
+        if usages.is_empty() {
+            return "\nNo Go usage in the last 30 days".to_string();
+        }
+        match go::worst_ratio(usages) {
+            Some((ratio, usage, window)) => {
+                let (used, limit) = usage.window_figures(window);
+                format!(
+                    "\nGo: {} ${used:.2} of ${limit:.2} ({:.0}%, {window})",
+                    usage.name,
+                    ratio * 100.0
+                )
+            }
+            None => "\nGo usage not priced (outside the published table)".to_string(),
         }
     }
     /// The hover text: title lines plus the reset time. Shared with `--once`
@@ -549,6 +592,9 @@ impl UsageTray {
                 }
                 if self.config.plan == config::Plan::Credit {
                     title.push_str(&self.credit_line());
+                }
+                if self.config.plan == config::Plan::Go {
+                    title.push_str(&self.go_line());
                 }
             }
             None => title.push_str("\nusage unavailable (database unreadable)"),
@@ -613,6 +659,33 @@ impl UsageTray {
                         _ => s.push_str(
                             "\nZen credit balance not set — use Configure, or: opencode-usage-tracker config balance <amount>",
                         ),
+                    }
+                }
+                if self.config.plan == config::Plan::Go {
+                    match &self.go {
+                        Some(usages) if !usages.is_empty() => {
+                            s.push_str("\nGo usage (estimated from token prices):");
+                            for usage in usages {
+                                if !usage.priced {
+                                    s.push_str(&format!(
+                                        "\n{}: not in the published price table",
+                                        usage.name
+                                    ));
+                                } else if let Some(limit) = usage.monthly_limit {
+                                    s.push_str(&format!(
+                                        "\n{}: ${:.2} of ${limit:.2} last 30 days · ${:.2} last 7 days · ${:.2} last 5 hours",
+                                        usage.name, usage.used_month, usage.used_week, usage.used_5h
+                                    ));
+                                } else {
+                                    s.push_str(&format!(
+                                        "\n{}: ${:.2} last 30 days (no published limit)",
+                                        usage.name, usage.used_month
+                                    ));
+                                }
+                            }
+                        }
+                        Some(_) => s.push_str("\nNo Go usage in the last 30 days"),
+                        None => s.push_str("\nGo usage unavailable"),
                     }
                 }
                 s
@@ -1082,6 +1155,7 @@ async fn main() {
             tokens: None,
             recent: None,
             spend: None,
+            go: None,
             running: false,
             working: false,
             frame: 0,
@@ -1106,6 +1180,7 @@ async fn main() {
         tokens: None,
         recent: None,
         spend: None,
+        go: None,
         running: false,
         working: false,
         frame: 0,
@@ -1168,6 +1243,7 @@ async fn main() {
                         tray.reload_config();
                     }
                     tray.spend = credit_spend(&tray.path, &tray.config);
+                    tray.go = go_usage(&tray.path, &tray.config);
                 })
                 .await;
             continue;
@@ -1219,6 +1295,7 @@ mod tests {
                 },
             ]),
             spend: None,
+            go: None,
             running,
             working: false,
             frame: 0,
@@ -1293,6 +1370,46 @@ mod tests {
         assert!(t.hover().title.contains("\nZen credit balance not set"));
         // No balance to judge by: the free counts drive the light.
         assert!(t.level() == Level::Green);
+    }
+
+    #[test]
+    fn go_plan_light_follows_the_tightest_window() {
+        let mut t = tray(Some(12), true);
+        t.config.plan = config::Plan::Go;
+        t.go = Some(vec![go::ModelUsage {
+            name: "Kimi K2.7 Code".to_string(),
+            priced: true,
+            used_5h: 0.0,
+            used_week: 0.0,
+            used_month: 30.0, // half the $60 monthly limit
+            monthly_limit: Some(60.0),
+        }]);
+        assert!(t.level() == Level::Green);
+        assert!(
+            t.hover()
+                .title
+                .contains("\nGo: Kimi K2.7 Code $30.00 of $60.00 (50%, last 30 days)")
+        );
+        let summary = t.summary();
+        assert!(summary.contains("Go usage (estimated from token prices):"));
+        assert!(summary.contains("Kimi K2.7 Code: $30.00 of $60.00 last 30 days"));
+        t.go.as_mut().unwrap()[0].used_5h = 10.0; // 10 / 12 = 83% of the 5-hour window
+        assert!(t.level() == Level::Yellow);
+        t.go.as_mut().unwrap()[0].used_5h = 12.0; // the whole 5-hour window
+        assert!(t.level() == Level::Red);
+    }
+
+    #[test]
+    fn go_plan_without_priced_usage_falls_back_to_free() {
+        let mut t = tray(Some(12), true);
+        t.config.plan = config::Plan::Go;
+        t.go = Some(vec![]);
+        assert!(t.level() == Level::Green); // 12 free requests: green
+        assert!(
+            t.hover()
+                .title
+                .contains("\nNo Go usage in the last 30 days")
+        );
     }
 
     #[test]
