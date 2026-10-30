@@ -8,10 +8,12 @@ On the default free plan, the color follows today's free-tier requests:
 
 | Icon color | Requests today |
 | --- | --- |
-| Green | fewer than 100 |
-| Yellow | 100 to 149 |
-| Red | 150 or more |
+| Green | fewer than 50 |
+| Yellow | 50 to 74 |
+| Red | 75 or more |
 | Gray | the database could not be read |
+
+The bands are conservative on purpose: the free allowance is not a fixed number (see [Counting](#counting)), and recent cutoffs have arrived below 90 requests in a day. Red means you are in the range where a cutoff has actually been seen, not that a limit is known.
 
 On the paid plans the light follows that plan's own resource instead: the estimated credit balance left, or how much of a Go model's tightest window limit is used.
 

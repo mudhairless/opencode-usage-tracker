@@ -6,9 +6,9 @@
 //! and colours the tray icon by the current UTC day — the day the Zen limiter
 //! gates on (it resets at 00:00 UTC):
 //!
-//!   green  < 100 requests
-//!   yellow 100–149
-//!   red    >= 150
+//!   green  < 50 requests
+//!   yellow 50–74
+//!   red    >= 75
 //!
 //! Counting mirrors the JS loader it is based on: `assistant` rows (plus
 //! `compaction` rows, which are real summarization calls) whose model is a
@@ -40,8 +40,8 @@ const SPIN_TICK: Duration = Duration::from_millis(250);
 const TICKS_PER_POLL: u64 = 120;
 const SPIN_FRAMES: u8 = 8;
 const ARC: f32 = 2.1; // radians of ring lit behind the head (~120°)
-const YELLOW_AT: u32 = 100;
-const RED_AT: u32 = 150;
+const YELLOW_AT: u32 = 50;
+const RED_AT: u32 = 75;
 /// Go mode turns yellow at this fraction of any window's limit.
 const GO_YELLOW_RATIO: f64 = 0.8;
 const ICON_SIZE: i32 = 44;
