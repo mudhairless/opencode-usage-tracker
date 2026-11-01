@@ -870,6 +870,16 @@ impl Tray for UsageTray {
             }
             .into(),
         );
+        items.push(
+            StandardItem {
+                label: "Open stats".to_string(),
+                activate: Box::new(|_: &mut Self| {
+                    std::thread::spawn(open_stats);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
@@ -1022,6 +1032,89 @@ fn open_config_file(path: &Path) {
         report_problem(&format!(
             "could not open the config file with xdg-open or $EDITOR ({editor}): {error}"
         ));
+    }
+}
+
+/// The argv that runs this tracker with `stats` in a terminal, for
+/// the first terminal `found` reports present, in the_watcher order:
+/// the user's configured terminal (`xdg-terminal-exec`) first, then
+/// the common fallbacks. Pure in `found` so the chain is testable
+/// without any terminal installed. `None` when no suitable terminal
+/// exists.
+fn terminal_argv(exe: &str, found: &dyn Fn(&str) -> bool) -> Option<Vec<String>> {
+    let run = [exe.to_string(), "stats".to_string()];
+    let with = |program: &str, middle: &[&str]| -> Vec<String> {
+        let mut argv = vec![program.to_string()];
+        argv.extend(middle.iter().map(ToString::to_string));
+        argv.extend(run.iter().cloned());
+        argv
+    };
+    if found("xdg-terminal-exec") {
+        Some(with("xdg-terminal-exec", &["--"]))
+    } else if found("konsole") {
+        Some(with("konsole", &["-e"]))
+    } else if found("gnome-terminal") {
+        Some(with("gnome-terminal", &["--"]))
+    } else if found("xfce4-terminal") {
+        // xfce4-terminal takes the whole command as one string.
+        let joined = run
+            .iter()
+            .map(|part| format!("\"{part}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(vec![
+            "xfce4-terminal".to_string(),
+            format!("--command={joined}"),
+        ])
+    } else if found("x-terminal-emulator") {
+        Some(with("x-terminal-emulator", &["-e"]))
+    } else if found("xterm") {
+        Some(with("xterm", &["-e"]))
+    } else {
+        None
+    }
+}
+
+/// Open the stats chart in a terminal: bare `stats` is a TUI and
+/// needs one to live in. With no suitable terminal, do nothing — the
+/// shell script this derives from exits silently too, and the tray
+/// has nowhere useful to complain.
+fn open_stats() {
+    let exe = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "opencode-usage-tracker".to_string());
+    let Some(argv) = terminal_argv(&exe, &|program| find_on_path(program).is_some()) else {
+        return;
+    };
+    let _ = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn();
+}
+
+/// Find an executable on `PATH`. `dialog.rs` has its own copy: that
+/// module stays self-contained on purpose.
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -1609,6 +1702,39 @@ mod tests {
         let credit_labels = menu_labels(&credit);
         assert!(credit_labels.iter().any(|label| label == "Set balance…"));
         assert!(credit_labels.iter().any(|label| label == "Plan: Credit"));
+    }
+
+    #[test]
+    fn open_stats_is_on_the_menu() {
+        let t = tray(Some(12), true);
+        assert!(menu_labels(&t).iter().any(|label| label == "Open stats"));
+    }
+
+    #[test]
+    fn terminal_chain_matches_the_watcher() {
+        let exe = "/home/x/.local/bin/opencode-usage-tracker";
+        // The configured terminal beats every fallback.
+        let argv =
+            terminal_argv(exe, &|p| matches!(p, "xdg-terminal-exec" | "konsole")).expect("argv");
+        assert_eq!(argv.join(" "), format!("xdg-terminal-exec -- {exe} stats"));
+        // konsole and xterm take -e; gnome-terminal takes --.
+        let argv = terminal_argv(exe, &|p| p == "konsole").expect("argv");
+        assert_eq!(argv.join(" "), format!("konsole -e {exe} stats"));
+        let argv = terminal_argv(exe, &|p| p == "gnome-terminal").expect("argv");
+        assert_eq!(argv.join(" "), format!("gnome-terminal -- {exe} stats"));
+        let argv = terminal_argv(exe, &|p| p == "xterm").expect("argv");
+        assert_eq!(argv.join(" "), format!("xterm -e {exe} stats"));
+        // xfce4-terminal takes the command as one quoted string.
+        let argv = terminal_argv(exe, &|p| p == "xfce4-terminal").expect("argv");
+        assert_eq!(
+            argv,
+            vec![
+                "xfce4-terminal".to_string(),
+                format!("--command=\"{exe}\" \"stats\""),
+            ]
+        );
+        // No suitable terminal: no argv, and open_stats stays silent.
+        assert!(terminal_argv(exe, &|_| false).is_none());
     }
 
     #[test]

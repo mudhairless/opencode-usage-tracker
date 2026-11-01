@@ -139,6 +139,7 @@ If the database cannot be read, `--once` prints `usage unavailable (database unr
 
 - Hovering shows today's free requests, the last hour's count, today's tokens, the last 3 days' totals, and the next reset time. On a paid plan it adds that plan's line: the estimated credit balance left, or the Go model closest to a window limit.
 - The menu carries the same figures in full: a summary, a per-day breakdown of the last 3 days, the paid plan's detail, a **Configure** submenu, **Refresh now**, and **Quit**.
+- **Open stats** launches the `stats` chart in a terminal: `xdg-terminal-exec` when available, else konsole, gnome-terminal, xfce4-terminal, x-terminal-emulator, or xterm. With none of those installed it does nothing.
 - Clicking the icon refreshes the counts.
 - While a request is streaming, the tracker polls once a second and animates the icon.
 - While OpenCode is not running, the icon is green and Plasma moves the item to the hidden tray area. The tooltip adds an `OpenCode not running` line.
