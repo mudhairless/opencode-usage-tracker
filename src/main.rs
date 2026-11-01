@@ -1015,13 +1015,19 @@ fn open_config_file(path: &Path) {
         .ok()
         .filter(|editor| !editor.trim().is_empty());
     let Some(editor) = editor else {
-        report_problem("could not open the config file with xdg-open and $EDITOR is not set");
+        report_problem(
+            "OpenCode config",
+            "could not open the config file with xdg-open and $EDITOR is not set",
+        );
         return;
     };
 
     let mut parts = editor.split_whitespace();
     let Some(program) = parts.next() else {
-        report_problem("could not open the config file with xdg-open and $EDITOR is empty");
+        report_problem(
+            "OpenCode config",
+            "could not open the config file with xdg-open and $EDITOR is empty",
+        );
         return;
     };
     if let Err(error) = std::process::Command::new(program)
@@ -1029,9 +1035,10 @@ fn open_config_file(path: &Path) {
         .arg(path)
         .spawn()
     {
-        report_problem(&format!(
-            "could not open the config file with xdg-open or $EDITOR ({editor}): {error}"
-        ));
+        report_problem(
+            "OpenCode config",
+            &format!("could not open the config file with xdg-open or $EDITOR ({editor}): {error}"),
+        );
     }
 }
 
@@ -1076,19 +1083,32 @@ fn terminal_argv(exe: &str, found: &dyn Fn(&str) -> bool) -> Option<Vec<String>>
 }
 
 /// Open the stats chart in a terminal: bare `stats` is a TUI and
-/// needs one to live in. With no suitable terminal, do nothing — the
-/// shell script this derives from exits silently too, and the tray
-/// has nowhere useful to complain.
+/// needs one to live in. The shell script this derives from exits
+/// silently when nothing fits, but a menu click that does nothing
+/// reads as a broken menu, so a missing terminal — or one that will
+/// not start — is reported like the config file's failures are.
 fn open_stats() {
     let exe = std::env::current_exe()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "opencode-usage-tracker".to_string());
     let Some(argv) = terminal_argv(&exe, &|program| find_on_path(program).is_some()) else {
+        report_problem(
+            "OpenCode usage",
+            "could not open stats: no suitable terminal found (looked for \
+             xdg-terminal-exec, konsole, gnome-terminal, xfce4-terminal, \
+             x-terminal-emulator, and xterm)",
+        );
         return;
     };
-    let _ = std::process::Command::new(&argv[0])
+    if let Err(error) = std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .spawn();
+        .spawn()
+    {
+        report_problem(
+            "OpenCode usage",
+            &format!("could not open stats in {}: {error}", argv[0]),
+        );
+    }
 }
 
 /// Find an executable on `PATH`. `dialog.rs` has its own copy: that
@@ -1118,10 +1138,10 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn report_problem(message: &str) {
+fn report_problem(title: &str, message: &str) {
     let dialogs = dialog::Dialogs::new();
     if dialogs.available() {
-        let _ = dialogs.show_error("OpenCode config", message);
+        let _ = dialogs.show_error(title, message);
     } else {
         eprintln!("{message}");
     }
@@ -1733,7 +1753,7 @@ mod tests {
                 format!("--command=\"{exe}\" \"stats\""),
             ]
         );
-        // No suitable terminal: no argv, and open_stats stays silent.
+        // No suitable terminal: no argv.
         assert!(terminal_argv(exe, &|_| false).is_none());
     }
 
