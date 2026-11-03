@@ -17,6 +17,13 @@
 //! catalog ids for the `opencode-go` provider, captured the same day.
 //! Models missing from the table (new or promotional) report usage
 //! without a price or a verdict rather than a guessed one.
+//!
+//! Rechecked Nov 2, 2026: DeepSeek V4.1 Flash's Go monthly limit is
+//! $100 in the current docs, not the $80 captured in October; the
+//! table below carries the corrected figure. The full Go Plus limit
+//! column was verified against the docs the same day: DeepSeek
+//! V4.1 Flash's Plus limit is $200, and the Plus figures the October
+//! capture left unpublished are now filled in.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -103,14 +110,14 @@ static MODELS: &[GoModel] = &[
         "glm-5.3",
         "GLM-5.3",
         Some(15.0),
-        None,
+        Some(120.0),
         tier(None, 1.40, 4.40, 0.26, 0.0),
     ),
     flat!(
         "glm-5.2",
         "GLM-5.2",
         Some(60.0),
-        None,
+        Some(180.0),
         tier(None, 1.40, 4.40, 0.26, 0.0),
     ),
     flat!(
@@ -124,7 +131,7 @@ static MODELS: &[GoModel] = &[
         "kimi-k3",
         "Kimi K3",
         Some(15.0),
-        None,
+        Some(60.0),
         tier(None, 3.00, 15.00, 0.30, 3.00),
     ),
     flat!(
@@ -138,14 +145,14 @@ static MODELS: &[GoModel] = &[
         "longcat-2.0",
         "LongCat-2.0",
         Some(60.0),
-        None,
+        Some(240.0),
         tier(None, 0.30, 1.20, 0.006, 0.0),
     ),
     flat!(
         "step-5-preview",
         "Step 5 Preview",
         Some(15.0),
-        None,
+        Some(60.0),
         tier(None, 1.00, 2.70, 0.10, 0.0),
     ),
     flat!(
@@ -173,21 +180,21 @@ static MODELS: &[GoModel] = &[
         "mimo-v2.6-pro",
         "MiMo-V2.6-Pro",
         Some(15.0),
-        None,
+        Some(60.0),
         tier(None, 0.435, 0.87, 0.003625, 0.0),
     ),
     flat!(
         "mimo-v2.5",
         "MiMo-V2.5",
         Some(60.0),
-        None,
+        Some(120.0),
         tier(None, 0.14, 0.28, 0.0028, 0.0),
     ),
     flat!(
         "mimo-v2.5-pro",
         "MiMo-V2.5-Pro",
         Some(15.0),
-        None,
+        Some(60.0),
         tier(None, 0.435, 0.87, 0.003625, 0.0),
     ),
     flat!(
@@ -220,21 +227,21 @@ static MODELS: &[GoModel] = &[
         "muse-spark-1.2-contributor",
         "Muse Spark 1.2 Contributor",
         Some(60.0),
-        None,
+        Some(120.0),
         tier(None, 0.10, 0.20, 0.002, 0.0),
     ),
     flat!(
         "qwen3.8-max",
         "Qwen3.8 Max",
         Some(15.0),
-        None,
+        Some(60.0),
         tier(None, 2.00, 6.00, 0.25, 2.50),
     ),
     flat!(
         "qwen3.8-flash",
         "Qwen3.8 Flash",
         Some(30.0),
-        None,
+        Some(90.0),
         tier(None, 0.15, 0.47, 0.016, 0.20),
     ),
     GoModel {
@@ -252,8 +259,8 @@ static MODELS: &[GoModel] = &[
     GoModel {
         id: "deepseek-v4.1-flash",
         name: "DeepSeek V4.1 Flash",
-        monthly_go: Some(80.0),
-        monthly_plus: Some(160.0),
+        monthly_go: Some(100.0),
+        monthly_plus: Some(200.0),
         peak_double: true,
         half_until_ms: None,
         tiers: &[tier(None, 0.15, 0.60, 0.003, 0.0)],
@@ -262,7 +269,7 @@ static MODELS: &[GoModel] = &[
         id: "deepseek-v4-pro",
         name: "DeepSeek V4 Pro",
         monthly_go: Some(15.0),
-        monthly_plus: None,
+        monthly_plus: Some(60.0),
         peak_double: true,
         half_until_ms: None,
         tiers: &[tier(None, 0.66, 1.98, 0.022, 0.0)],
@@ -271,21 +278,21 @@ static MODELS: &[GoModel] = &[
         "hy4-preview",
         "Hy4 preview",
         Some(30.0),
-        None,
+        Some(120.0),
         tier(None, 0.834, 2.501, 0.042, 0.0),
     ),
     flat!(
         "hy3",
         "Hy3",
         Some(60.0),
-        None,
+        Some(240.0),
         tier(None, 0.14, 0.58, 0.035, 0.0),
     ),
     GoModel {
         id: "grok-4.7",
         name: "Grok 4.7",
         monthly_go: Some(15.0),
-        monthly_plus: None,
+        monthly_plus: Some(60.0),
         peak_double: false,
         half_until_ms: None,
         tiers: &[
@@ -309,7 +316,7 @@ static MODELS: &[GoModel] = &[
         id: "gpt-5.6-luna",
         name: "GPT 5.6 Luna",
         monthly_go: Some(15.0),
-        monthly_plus: None,
+        monthly_plus: Some(60.0),
         peak_double: false,
         half_until_ms: None,
         tiers: &[
@@ -420,10 +427,12 @@ pub fn price(model: &GoModel, tokens: Tokens, created_ms: i64) -> f64 {
     value
 }
 
-/// One model's priced usage over the three rolling windows, with the
-/// monthly limit for the configured plan. `priced` is false when the
-/// model is outside the published table: its usage is real but cannot
-/// be turned into dollars here.
+/// One model's priced usage over the three windows, with the
+/// monthly limit for the configured plan. The monthly window is the
+/// current billing cycle when a reset date is configured, and a
+/// rolling 30 days otherwise. `priced` is false when the model is
+/// outside the published table: its usage is real but cannot be
+/// turned into dollars here.
 #[derive(Clone, Debug, Default)]
 pub struct ModelUsage {
     pub name: String,
@@ -435,56 +444,53 @@ pub struct ModelUsage {
 }
 
 impl ModelUsage {
-    /// The (used, window limit) pair for a window label from `worst`.
-    pub fn window_figures(&self, window: &str) -> (f64, f64) {
-        let monthly = self.monthly_limit.unwrap_or(0.0);
-        match window {
-            "last 5 hours" => (self.used_5h, monthly * 0.2),
-            "last 7 days" => (self.used_week, monthly * 0.5),
-            _ => (self.used_month, monthly),
-        }
+    /// The 5-hour window's share of its limit (20% of the monthly
+    /// limit): the ratio the tray light follows. `None` when no limit
+    /// is published for this model.
+    pub fn ratio_5h(&self) -> Option<f64> {
+        Some(self.used_5h / (self.monthly_limit? * 0.2))
     }
 
-    /// The tightest window: the highest used/limit ratio and its label,
-    /// or `None` when no limit is published for this model.
-    pub fn worst(&self) -> Option<(f64, &'static str)> {
-        let monthly = self.monthly_limit?;
-        let mut best: Option<(f64, &'static str)> = None;
-        for (used, fraction, label) in [
-            (self.used_5h, 0.2, "last 5 hours"),
-            (self.used_week, 0.5, "last 7 days"),
-            (self.used_month, 1.0, "last 30 days"),
-        ] {
-            let ratio = used / (monthly * fraction);
-            if best.is_none_or(|(r, _)| ratio > r) {
-                best = Some((ratio, label));
-            }
-        }
-        best
+    /// The monthly window's share of its limit. `None` when no limit
+    /// is published for this model.
+    pub fn monthly_ratio(&self) -> Option<f64> {
+        Some(self.used_month / self.monthly_limit?)
     }
 }
 
-/// The tightest (model, window) across all usage: the figure the tray
-/// light follows in Go mode.
-pub fn worst_ratio(usages: &[ModelUsage]) -> Option<(f64, &ModelUsage, &'static str)> {
-    let mut best: Option<(f64, &ModelUsage, &'static str)> = None;
+/// The tightest 5-hour window across models: the highest ratio and
+/// the model at it. The tray light follows this one window; the
+/// weekly and monthly figures are context for the hover and menu.
+pub fn worst_5h_ratio(usages: &[ModelUsage]) -> Option<(f64, &ModelUsage)> {
+    let mut best: Option<(f64, &ModelUsage)> = None;
     for usage in usages {
-        if let Some((ratio, label)) = usage.worst()
-            && best.is_none_or(|(r, _, _)| ratio > r)
+        if let Some(ratio) = usage.ratio_5h()
+            && best.is_none_or(|(r, _)| ratio > r)
         {
-            best = Some((ratio, usage, label));
+            best = Some((ratio, usage));
         }
     }
     best
 }
 
-/// Price the last 30 days of Go usage from the local database, grouped
-/// by model, oldest window outermost. Mirrors the tracker's counting
-/// rules: assistant rows that never finished are skipped, compaction
-/// rows count as-is. `None` when the database can't be read.
-pub fn collect_usage(path: &PathBuf, plan: config::GoTier, now_ms: i64) -> Option<Vec<ModelUsage>> {
+/// Price Go usage from the local database, grouped by model. The
+/// windows end at `now_ms`: 5 hours, 7 days, and the monthly window,
+/// which starts at `cycle_start_ms` when a billing cycle is
+/// configured and 30 days back otherwise. Mirrors the tracker's
+/// counting rules: assistant rows that never finished are skipped,
+/// compaction rows count as-is. `None` when the database can't be
+/// read.
+pub fn collect_usage(
+    path: &PathBuf,
+    plan: config::GoTier,
+    now_ms: i64,
+    cycle_start_ms: Option<i64>,
+) -> Option<Vec<ModelUsage>> {
     let conn = open_db(path)?;
-    let month_start = now_ms - 30 * DAY_MS;
+    // The read reaches back to whichever start is older, the monthly
+    // window's or 30 days, so the weekly window is covered either way.
+    let month_start = cycle_start_ms.unwrap_or(now_ms - 30 * DAY_MS);
+    let read_start = month_start.min(now_ms - 30 * DAY_MS);
     let week_start = now_ms - 7 * DAY_MS;
     let five_h_start = now_ms - 5 * HOUR_MS;
     let mut stmt = conn
@@ -494,7 +500,7 @@ pub fn collect_usage(path: &PathBuf, plan: config::GoTier, now_ms: i64) -> Optio
         )
         .ok()?;
     let rows = stmt
-        .query_map([month_start], |r| {
+        .query_map([read_start], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -543,7 +549,9 @@ pub fn collect_usage(path: &PathBuf, plan: config::GoTier, now_ms: i64) -> Optio
             continue;
         };
         let value = price(known, tokens_of(&v), created);
-        usage.used_month += value;
+        if created >= month_start {
+            usage.used_month += value;
+        }
         if created >= week_start {
             usage.used_week += value;
         }
@@ -717,7 +725,7 @@ mod tests {
         insert(&conn, now - HOUR_MS, "opencode-go", "cat-jam-free", true);
         drop(conn);
 
-        let usages = collect_usage(&path, config::GoTier::Go, now).expect("collect");
+        let usages = collect_usage(&path, config::GoTier::Go, now, None).expect("collect");
         let _ = std::fs::remove_file(&path);
         assert_eq!(usages.len(), 2);
         let kimi = usages.iter().find(|u| u.name == "Kimi K2.7 Code").unwrap();
@@ -728,7 +736,8 @@ mod tests {
         let cat = usages.iter().find(|u| u.name == "cat-jam-free").unwrap();
         assert!(!cat.priced);
         assert_eq!(cat.monthly_limit, None);
-        assert!(cat.worst().is_none());
+        assert!(cat.monthly_ratio().is_none());
+        assert!(cat.ratio_5h().is_none());
 
         // The same usage under the other plans: Teams adds $5, Plus uses
         // its own published figure for this model.
@@ -736,15 +745,46 @@ mod tests {
         let conn = Connection::open(&path2).unwrap();
         insert(&conn, now - HOUR_MS, "opencode-go", "kimi-k2.7-code", true);
         drop(conn);
-        let teams = collect_usage(&path2, config::GoTier::GoTeams, now).expect("collect");
+        let teams = collect_usage(&path2, config::GoTier::GoTeams, now, None).expect("collect");
         assert_eq!(teams[0].monthly_limit, Some(65.0));
-        let plus = collect_usage(&path2, config::GoTier::GoPlus, now).expect("collect");
+        let plus = collect_usage(&path2, config::GoTier::GoPlus, now, None).expect("collect");
         assert_eq!(plus[0].monthly_limit, Some(180.0));
         let _ = std::fs::remove_file(&path2);
     }
 
     #[test]
-    fn worst_ratio_picks_the_tightest_window() {
+    fn collect_usage_honors_a_cycle_start() {
+        let path = scratch_db("cycle");
+        let conn = Connection::open(&path).unwrap();
+        let now = ms("2026-10-29T12:00:00Z");
+        // One $0.95 Kimi request 20 days back: inside a rolling 30
+        // days, outside a cycle that started 10 days ago.
+        insert(
+            &conn,
+            now - 20 * DAY_MS,
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        insert(&conn, now - HOUR_MS, "opencode-go", "kimi-k2.7-code", true);
+        drop(conn);
+        let rolling = collect_usage(&path, config::GoTier::Go, now, None).expect("collect");
+        let kimi = rolling.iter().find(|u| u.name == "Kimi K2.7 Code").unwrap();
+        close(kimi.used_month, 1.90);
+        let anchored = collect_usage(&path, config::GoTier::Go, now, Some(now - 10 * DAY_MS))
+            .expect("collect");
+        let _ = std::fs::remove_file(&path);
+        let kimi = anchored
+            .iter()
+            .find(|u| u.name == "Kimi K2.7 Code")
+            .unwrap();
+        close(kimi.used_month, 0.95);
+        // The weekly window reaches back past the cycle start either way.
+        close(kimi.used_week, 0.95);
+    }
+
+    #[test]
+    fn window_ratios_and_the_worst_5h() {
         let mut a = ModelUsage {
             name: "A".to_string(),
             priced: true,
@@ -753,22 +793,18 @@ mod tests {
             used_month: 30.0,
             monthly_limit: Some(60.0),
         };
-        // A's tightest is the week: 20 / (60 * 0.5) = 0.667.
-        let (ratio, label) = a.worst().unwrap();
-        close(ratio, 20.0 / 30.0);
-        assert_eq!(label, "last 7 days");
-        let (used, limit) = a.window_figures("last 7 days");
-        close(used, 20.0);
-        close(limit, 30.0);
+        // Monthly: 30 / 60 = 0.5. 5-hour: 1 / (60 * 0.2).
+        close(a.monthly_ratio().unwrap(), 0.5);
+        close(a.ratio_5h().unwrap(), 1.0 / 12.0);
         let b = ModelUsage {
             monthly_limit: None,
             ..a.clone()
         };
+        assert!(b.ratio_5h().is_none());
         a.used_5h = 12.0; // exactly the 5-hour limit of 12
         let usages = [a, b];
-        let (ratio, usage, label) = worst_ratio(&usages).unwrap();
+        let (ratio, usage) = worst_5h_ratio(&usages).unwrap();
         close(ratio, 1.0);
         assert_eq!(usage.name, "A");
-        assert_eq!(label, "last 5 hours");
     }
 }

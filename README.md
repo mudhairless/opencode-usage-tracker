@@ -217,6 +217,8 @@ Change settings three ways, all through the same writer so the comments survive:
 | --- | --- | --- |
 | `plan` | `free`, `go`, `credit` | Which resource the light follows. Default `free`. |
 | `go.tier` | `go`, `go_plus`, `go_teams` | Your Go tier, whose per-model limits the Go light uses. |
+| `go.cycle_reset` | date | The day the current Go billing cycle last reset (`YYYY-MM-DD`). When set, the monthly window is measured from the cycle start instead of over a rolling 30 days. |
+| `go.limit_notify` | `true`, `false` | Show a desktop notification once when a model reaches its monthly limit. Default `true`. |
 | `balance` | dollars | Current Zen credit balance (credit plan). Setting it stamps `balance_as_of`; reading it prints the stamp too. |
 | `balance_as_of` | UTC timestamp | When the balance was last set. Recorded spend after this moment is subtracted from the balance. |
 | `balance_reminder` | `true`, `false` | On OpenCode launch, remind when the balance is unset or a day old. Default `true`. |
@@ -228,7 +230,7 @@ Change settings three ways, all through the same writer so the comments survive:
 The tracker also understands the two paid ways to use Zen. Set your plan with `opencode-usage-tracker config plan credit` or `opencode-usage-tracker config plan go`; `free` is the default.
 
 - **Zen credit.** You enter your current balance (the tray's Configure menu, or `opencode-usage-tracker config balance 25.00`), and the tracker subtracts the recorded cost of paid requests made after the moment you entered it. The light follows the estimated balance left. Spend from other machines on the same account is not in the local database, so the estimate cannot see it. When the last 7 days include billed spend, the hover and menu add a runway line: the estimated balance left divided by that week's average daily burn.
-- **OpenCode Go.** Go usage within its limits records a cost of zero, so the tracker prices each request's tokens with OpenCode's published per-model rates and compares the totals against the published window limits (5 hours at 20% of the monthly limit, 7 days at 50%, the month at 100%) for your tier.
+- **OpenCode Go.** Go usage within its limits records a cost of zero, so the tracker prices each request's tokens with OpenCode's published per-model rates and compares the totals against the published window limits (5 hours at 20% of the monthly limit, 7 days at 50%, the month at 100%) for your tier. The light itself follows the 5-hour window, the one that binds during a burst; the weekly and monthly figures are in the menu. Set `go.cycle_reset` to anchor the monthly window to your billing cycle instead of a rolling 30 days, and the tracker notifies you once when a model reaches its monthly limit (silence it with `go.limit_notify`).
 
 The Go support is **untested with actual data**. The prices and limits come from OpenCode's published pages, and the arithmetic is verified against synthetic records, but the maintainer does not subscribe to Go and has never checked the figures against a live account. If you do subscribe, feedback is very welcome: an issue setting the tracker's numbers beside the Zen console's is exactly what is needed to calibrate it.
 

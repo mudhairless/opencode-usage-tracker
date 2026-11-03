@@ -8,12 +8,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
+use chrono::Datelike;
 use toml_edit::{DocumentMut, Item, Table};
 
 /// Every key the CLI understands, in the order `--list` reports them.
 const KEYS: &[&str] = &[
     "plan",
     "go.tier",
+    "go.cycle_reset",
+    "go.limit_notify",
     "balance",
     "balance_as_of",
     "balance_reminder",
@@ -70,6 +73,17 @@ red_percent = 10
 #     opencode-usage-tracker config go.tier go_plus
 [go]
 tier = "go"
+
+# The date your current Go billing cycle last reset (YYYY-MM-DD). When
+# set, the monthly window is measured from the cycle start instead of
+# over a rolling 30 days; the date rolls forward by whole months on its
+# own, so you only set it once. Leave it unset if you do not know it.
+#     opencode-usage-tracker config go.cycle_reset 2026-11-15
+# cycle_reset = 2026-11-15
+
+# Show a desktop notification when a model reaches its monthly limit.
+# Set this to false to silence it.
+limit_notify = true
 "#;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -130,6 +144,9 @@ impl GoTier {
 pub struct Config {
     pub plan: Plan,
     pub go_tier: GoTier,
+    /// Raw `YYYY-MM-DD` string; see [`Config::cycle_reset`] for the parsed form.
+    pub go_cycle_reset: Option<String>,
+    pub go_limit_notify: bool,
     pub balance: Option<f64>,
     /// Raw RFC 3339 string; see [`Config::balance_time`] for the parsed form.
     pub balance_as_of: Option<String>,
@@ -143,6 +160,8 @@ impl Default for Config {
         Config {
             plan: Plan::Free,
             go_tier: GoTier::Go,
+            go_cycle_reset: None,
+            go_limit_notify: true,
             balance: None,
             balance_as_of: None,
             balance_reminder: true,
@@ -156,6 +175,27 @@ impl Config {
     /// `balance_as_of` as a real timestamp, or `None` when unset or malformed.
     pub fn balance_time(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
         chrono::DateTime::parse_from_rfc3339(self.balance_as_of.as_deref()?).ok()
+    }
+
+    /// The stored Go billing-cycle reset date, parsed, or `None` when
+    /// unset or malformed.
+    pub fn cycle_reset(&self) -> Option<chrono::NaiveDate> {
+        chrono::NaiveDate::parse_from_str(self.go_cycle_reset.as_deref()?, "%Y-%m-%d").ok()
+    }
+
+    /// The start of the billing cycle containing `now_ms`, as epoch
+    /// milliseconds at 00:00 UTC: the stored reset date rolled forward
+    /// by whole months (see [`cycle_start`]). `None` when no reset
+    /// date is set.
+    pub fn cycle_start_ms(&self, now_ms: i64) -> Option<i64> {
+        let reset = self.cycle_reset()?;
+        let today = chrono::DateTime::from_timestamp_millis(now_ms)?.date_naive();
+        Some(
+            cycle_start(reset, today)
+                .and_hms_opt(0, 0, 0)?
+                .and_utc()
+                .timestamp_millis(),
+        )
     }
 }
 
@@ -206,14 +246,23 @@ pub fn set_value(path: &Path, key: &str, raw: &str) -> Result<String> {
         "go.tier" => {
             let tier = GoTier::parse(raw)
                 .ok_or_else(|| anyhow!("go.tier must be one of: go, go_plus, go_teams"))?;
-            let item = doc.entry("go").or_insert(Item::Table(Table::new()));
-            if !item.is_table() {
-                *item = Item::Table(Table::new());
-            }
-            item.as_table_mut()
-                .expect("go is a table")
-                .insert("tier", toml_edit::value(tier.as_str()));
+            go_table(&mut doc).insert("tier", toml_edit::value(tier.as_str()));
             format!("go.tier = {}", tier.as_str())
+        }
+        "go.cycle_reset" => {
+            chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .map_err(|_| anyhow!("go.cycle_reset must be a date, e.g. 2026-11-15"))?;
+            go_table(&mut doc).insert("cycle_reset", toml_edit::value(raw));
+            format!("go.cycle_reset = {raw}")
+        }
+        "go.limit_notify" => {
+            let on = match raw {
+                "true" => true,
+                "false" => false,
+                _ => bail!("go.limit_notify must be true or false"),
+            };
+            go_table(&mut doc).insert("limit_notify", toml_edit::value(on));
+            format!("go.limit_notify = {on}")
         }
         "balance" => {
             let balance = parse_money(raw)?;
@@ -392,6 +441,24 @@ fn from_doc(doc: &DocumentMut) -> Config {
     {
         cfg.go_tier = tier;
     }
+    if let Some(table) = doc.get("go").and_then(|i| i.as_table()) {
+        if let Some(item) = table.get("cycle_reset") {
+            // Quoted strings are what this build writes; a hand edit may
+            // use a native TOML date instead, so accept both.
+            let raw = item
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| item.as_datetime().map(|d| d.to_string()));
+            if let Some(raw) = raw
+                && chrono::NaiveDate::parse_from_str(&raw, "%Y-%m-%d").is_ok()
+            {
+                cfg.go_cycle_reset = Some(raw);
+            }
+        }
+        if let Some(on) = table.get("limit_notify").and_then(|i| i.as_bool()) {
+            cfg.go_limit_notify = on;
+        }
+    }
     if let Some(balance) = doc.get("balance").and_then(number)
         && balance >= 0.0
     {
@@ -429,6 +496,11 @@ fn effective(cfg: &Config, key: &str) -> String {
     match key {
         "plan" => cfg.plan.as_str().to_string(),
         "go.tier" => cfg.go_tier.as_str().to_string(),
+        "go.cycle_reset" => cfg
+            .go_cycle_reset
+            .clone()
+            .unwrap_or_else(|| "(unset)".to_string()),
+        "go.limit_notify" => cfg.go_limit_notify.to_string(),
         "balance" => cfg
             .balance
             .map_or_else(|| "(unset)".to_string(), |b| format!("{b:.2}")),
@@ -478,6 +550,50 @@ fn fmt_num(n: f64) -> String {
     }
 }
 
+/// The `[go]` table, created when missing or replaced when some other
+/// type squats on the name.
+fn go_table(doc: &mut DocumentMut) -> &mut Table {
+    let item = doc.entry("go").or_insert(Item::Table(Table::new()));
+    if !item.is_table() {
+        *item = Item::Table(Table::new());
+    }
+    item.as_table_mut().expect("go is a table")
+}
+
+/// The first day of the billing cycle containing `today`, given the
+/// date a cycle last reset: `reset` advanced by whole months until it
+/// is the latest reset not after `today`. Stepping is computed from
+/// the stored date each time, so a reset on the 31st lands on the 31st
+/// again after a short month instead of drifting.
+fn cycle_start(reset: chrono::NaiveDate, today: chrono::NaiveDate) -> chrono::NaiveDate {
+    let months = (today.year() - reset.year()) * 12 + (today.month() as i32 - reset.month() as i32);
+    let candidate = add_months(reset, months);
+    if candidate > today {
+        add_months(reset, months - 1)
+    } else {
+        candidate
+    }
+}
+
+fn add_months(date: chrono::NaiveDate, months: i32) -> chrono::NaiveDate {
+    let total = date.year() * 12 + (date.month() as i32 - 1) + months;
+    let year = total.div_euclid(12);
+    let month = (total.rem_euclid(12) + 1) as u32;
+    let day = date.day().min(days_in_month(year, month));
+    chrono::NaiveDate::from_ymd_opt(year, month, day).expect("a clamped date is valid")
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_next =
+        chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1).expect("a valid first");
+    (first_next - chrono::Duration::days(1)).day()
+}
+
 fn now_datetime() -> toml_edit::Datetime {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%SZ")
@@ -507,6 +623,8 @@ mod tests {
 
         assert_eq!(cfg.plan, Plan::Free);
         assert_eq!(cfg.go_tier, GoTier::Go);
+        assert!(cfg.go_cycle_reset.is_none());
+        assert!(cfg.go_limit_notify);
         assert!(cfg.balance.is_none());
         assert!(cfg.balance_as_of.is_none());
         assert!(cfg.balance_reminder);
@@ -624,5 +742,65 @@ mod tests {
         let cfg = load_or_default(&path);
         assert_eq!(cfg.plan, Plan::Free);
         assert!(cfg.balance.is_none());
+    }
+
+    #[test]
+    fn go_cycle_keys_roundtrip() {
+        let path = scratch_path("go-cycle");
+
+        set_value(&path, "go.cycle_reset", "2026-11-15").expect("set reset");
+        assert_eq!(
+            get_value(&path, "go.cycle_reset").expect("get reset"),
+            "2026-11-15"
+        );
+        assert!(set_value(&path, "go.cycle_reset", "Nov 15").is_err());
+
+        // The notification defaults to on, and turns off.
+        assert_eq!(
+            get_value(&path, "go.limit_notify").expect("get notify"),
+            "true"
+        );
+        set_value(&path, "go.limit_notify", "false").expect("set notify");
+        assert!(set_value(&path, "go.limit_notify", "maybe").is_err());
+
+        let cfg = load(&path).expect("reload");
+        assert!(!cfg.go_limit_notify);
+        assert_eq!(
+            cfg.cycle_reset(),
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 15)
+        );
+
+        let text = std::fs::read_to_string(&path).expect("file");
+        assert!(text.contains("[go]"), "file:\n{text}");
+    }
+
+    #[test]
+    fn cycle_start_rolls_forward_from_the_stored_date() {
+        let date = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        // Mid-cycle: the start is the most recent reset.
+        assert_eq!(
+            cycle_start(date(2026, 8, 15), date(2026, 11, 2)),
+            date(2026, 10, 15)
+        );
+        // On the reset day itself, the new cycle has begun.
+        assert_eq!(
+            cycle_start(date(2026, 8, 15), date(2026, 11, 15)),
+            date(2026, 11, 15)
+        );
+        // A stored date in the future steps back to the current cycle.
+        assert_eq!(
+            cycle_start(date(2026, 11, 15), date(2026, 11, 2)),
+            date(2026, 10, 15)
+        );
+        // A 31st reset clamps into short months without drifting:
+        // February starts on the 28th, March is back on the 31st.
+        assert_eq!(
+            cycle_start(date(2026, 1, 31), date(2026, 3, 15)),
+            date(2026, 2, 28)
+        );
+        assert_eq!(
+            cycle_start(date(2026, 1, 31), date(2026, 3, 31)),
+            date(2026, 3, 31)
+        );
     }
 }
