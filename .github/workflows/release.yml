@@ -27,10 +27,26 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-  release:
+  # The upload action attaches assets to an existing release; it does
+  # not create one. Create it here, once, so both matrix legs upload
+  # into the same release instead of racing to create it.
+  create:
     needs: test
     runs-on: ubuntu-latest
+    steps:
+      - name: Create the release if it does not exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+
+  release:
+    needs: [test, create]
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-unknown-linux-musl
