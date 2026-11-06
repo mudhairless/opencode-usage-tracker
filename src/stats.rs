@@ -1009,11 +1009,13 @@ impl Metric {
     /// and light fills take black.
     fn styles(self) -> (Style, Style) {
         match self {
-            // Calm blue rather than the glaring green.
+            // Calm blue rather than the glaring green. The value text
+            // is bright white on every metric: it prints at the bar's
+            // base, and the darker styles blended into the fill.
             Metric::Tokens => (Style::default().blue(), Style::default().white()),
-            Metric::Requests => (Style::default().green(), Style::default().black()),
-            Metric::Cost => (Style::default().yellow(), Style::default().black()),
-            _ => (Style::default().cyan(), Style::default().black()),
+            Metric::Requests => (Style::default().green(), Style::default().white()),
+            Metric::Cost => (Style::default().yellow(), Style::default().white()),
+            _ => (Style::default().cyan(), Style::default().white()),
         }
     }
 }
