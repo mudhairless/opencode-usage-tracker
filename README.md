@@ -1,3 +1,5 @@
+<p align="center"><img src="images/logo.jpg" alt="A golden-age-comics noir detective with long hair and a long beard, examining the OpenCode logo through a magnifying glass" width="260"></p>
+
 # opencode-usage-tracker
 
 [![Rust](https://github.com/mudhairless/opencode-usage-tracker/actions/workflows/rust.yml/badge.svg)](https://github.com/mudhairless/opencode-usage-tracker/actions/workflows/rust.yml)
