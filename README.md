@@ -153,6 +153,7 @@ If the database cannot be read, `--once` prints `usage unavailable (database unr
 | `←` and `→`, or `h` and `l` | Slide the window one row. Works only when more rows are loaded than fit on screen. |
 | `Tab` | Cycle the metric: tokens, requests, and cost with the default fields. A narrower `--fields` selection cycles what it carries. |
 | `b` | Switch between bars and a line. |
+| `f` | Switch to the tool-failures screen: failed tool calls per day over the same range, with a per-tool breakdown below the chart. Press `f` again to go back. A failure is a tool part in the message data whose state is an error, the same definition as a manual audit of the database. |
 | `q` or `Esc` | Quit. |
 
 ### stats options

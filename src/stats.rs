@@ -8,6 +8,8 @@
 //! `--days` overrides that count; when the report spans more days than fit,
 //! the arrow keys slide the window a day at a time. Bars are the default:
 //! `b` switches to a line, `Tab` switches between tokens and requests.
+//! `f` switches to a second screen: failed tool calls per day, counted
+//! from the tool parts in message data, with a per-tool breakdown.
 //!
 //! Below the chart sits the composable query engine (Phase 4): one query —
 //! range, grouping, field selection, filters — evaluated into a single
@@ -806,6 +808,109 @@ pub fn build_query(opts: &StatsOptions) -> Result<Query, String> {
     })
 }
 
+/// Failed tool calls over a range, counted from the tool parts inside
+/// message data: per UTC day and per tool. The definition matches the
+/// standalone failed-tool audit: a part counts when its type is `tool`
+/// and its state status is `error`, and the walk does not descend into
+/// a tool part, whose input can hold lookalike objects that are not
+/// calls. A failure is dated by its containing row's `time_created`.
+#[derive(Clone, Debug, Default)]
+pub struct ToolFailures {
+    pub total: u64,
+    /// (day, failed calls), chronological, every day in the range
+    /// present even at zero.
+    pub days: Vec<(String, u64)>,
+    /// (tool name, failed calls), most failures first, ties by name.
+    pub by_tool: Vec<(String, u64)>,
+}
+
+/// Count failed tool calls in `[query.from_ms, query.to_ms)`. Every
+/// message row is scanned, not just assistant rows: tool parts ride
+/// inside several row shapes. `None` when the database can't be read.
+pub fn collect_tool_failures(path: &PathBuf, query: &Query) -> Option<ToolFailures> {
+    let conn = open_db(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT data, time_created FROM session_message \
+             WHERE time_created >= ?1 AND time_created < ?2",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([query.from_ms, query.to_ms], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .ok()?;
+
+    let mut per_day: std::collections::BTreeMap<i64, u64> = std::collections::BTreeMap::new();
+    let mut per_tool: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut total = 0u64;
+    for row in rows {
+        let Ok((data, created)) = row else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let mut hits: Vec<String> = Vec::new();
+        collect_failed_tools(&value, &mut hits);
+        if hits.is_empty() {
+            continue;
+        }
+        *per_day.entry(utc_day_start_ms(created)).or_insert(0) += hits.len() as u64;
+        for tool in hits {
+            *per_tool.entry(tool).or_insert(0) += 1;
+            total += 1;
+        }
+    }
+
+    let mut days = Vec::new();
+    let mut day = utc_day_start_ms(query.from_ms);
+    let last = utc_day_start_ms(query.to_ms - 1);
+    while day <= last {
+        days.push((day_label(day), per_day.get(&day).copied().unwrap_or(0)));
+        day += DAY_MS;
+    }
+    let mut by_tool: Vec<(String, u64)> = per_tool.into_iter().collect();
+    by_tool.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Some(ToolFailures {
+        total,
+        days,
+        by_tool,
+    })
+}
+
+/// Append the name of every failed tool call in a message value,
+/// mirroring the audit's walk: a `tool` object with a state is a call
+/// (failed when its status is `error`) and is not descended into.
+fn collect_failed_tools(value: &serde_json::Value, hits: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_tool = map.get("type").and_then(|t| t.as_str()) == Some("tool");
+            let state = map.get("state").filter(|s| s.is_object());
+            if is_tool && let Some(state) = state {
+                if state.get("status").and_then(|s| s.as_str()) == Some("error") {
+                    let name = map
+                        .get("name")
+                        .or_else(|| map.get("tool"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("(unknown)");
+                    hits.push(name.to_string());
+                }
+                return;
+            }
+            for child in map.values() {
+                collect_failed_tools(child, hits);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_failed_tools(child, hits);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Run a composable stats query to the console: JSON with `--json`,
 /// the text table with `--text`. Any other invocation renders the
 /// chart instead (see `run`).
@@ -984,6 +1089,14 @@ fn bar_width_for(rows: &[ReportRow]) -> u16 {
     longest.clamp(BAR_WIDTH, 24)
 }
 
+/// Which chart screen is showing: the usage report, or the failed
+/// tool calls counted from message parts. `f` switches between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Usage,
+    Failures,
+}
+
 fn run_chart(path: &PathBuf, opts: &StatsOptions) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let result = chart_loop(&mut terminal, path, opts);
@@ -999,21 +1112,24 @@ fn chart_loop(
     // With no pinned range the day count follows the terminal width, as
     // the chart has always done; --days or --from/--to pins it.
     let pinned = opts.days.is_some() || opts.from.is_some() || opts.to.is_some();
-    let load = |width: u16| -> Option<(Report, Vec<Metric>)> {
+    let load = |width: u16| -> Option<(Report, Vec<Metric>, ToolFailures)> {
         let mut o = opts.clone();
         if !pinned {
             o.days = Some(fit_days(width));
         }
         let query = build_query(&o).ok()?;
         let report = collect_report(path, &query)?;
+        let failures = collect_tool_failures(path, &query)?;
         let metrics = metrics_for(&query);
-        Some((report, metrics))
+        Some((report, metrics, failures))
     };
-    let (mut report, mut metrics) = load(screen_width(terminal))
+    let (mut report, mut metrics, mut failures) = load(screen_width(terminal))
         .ok_or_else(|| io::Error::other(format!("could not read {}", path.display())))?;
     let mut window_start = 0usize; // first visible row
+    let mut fail_start = 0usize; // first visible day on the failures screen
     let mut metric_idx = 0usize;
     let mut bars = true; // true bar chart, false line chart
+    let mut screen = Screen::Usage;
     loop {
         // More rows loaded than fit on screen: show one screenful and
         // let the arrow keys slide it.
@@ -1023,37 +1139,65 @@ fn chart_loop(
             .len()
             .min(fit_count(screen_width(terminal), bar_width) as usize);
         window_start = window_start.min(report.rows.len().saturating_sub(max_visible));
-        let metric = metrics[metric_idx % metrics.len()];
-        terminal.draw(|frame| {
-            draw(
-                frame,
-                &report,
-                window_start,
-                max_visible,
-                metric,
-                bars,
-                bar_width,
-            )
-        })?;
+        let fail_max_visible = failures
+            .days
+            .len()
+            .min(fit_count(screen_width(terminal), BAR_WIDTH) as usize);
+        fail_start = fail_start.min(failures.days.len().saturating_sub(fail_max_visible));
+        match screen {
+            Screen::Usage => {
+                let metric = metrics[metric_idx % metrics.len()];
+                terminal.draw(|frame| {
+                    draw(
+                        frame,
+                        &report,
+                        window_start,
+                        max_visible,
+                        metric,
+                        bars,
+                        bar_width,
+                    )
+                })?;
+            }
+            Screen::Failures => {
+                terminal.draw(|frame| {
+                    draw_failures(frame, &failures, fail_start, fail_max_visible, bars)
+                })?;
+            }
+        }
         match event::read()? {
             // Re-fit on resize, so the bars keep filling the terminal,
             // unless the range pinned the count.
             Event::Resize(width, _) if !pinned => {
-                if let Some((fresh, fresh_metrics)) = load(width) {
+                if let Some((fresh, fresh_metrics, fresh_failures)) = load(width) {
                     report = fresh;
                     metrics = fresh_metrics;
+                    failures = fresh_failures;
                     metric_idx = metric_idx.min(metrics.len() - 1);
                 }
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Left | KeyCode::Char('h') => {
-                    window_start = window_start.saturating_sub(1);
+                KeyCode::Char('f') => {
+                    screen = match screen {
+                        Screen::Usage => Screen::Failures,
+                        Screen::Failures => Screen::Usage,
+                    };
                 }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    window_start =
-                        (window_start + 1).min(report.rows.len().saturating_sub(max_visible));
-                }
+                KeyCode::Left | KeyCode::Char('h') => match screen {
+                    Screen::Usage => window_start = window_start.saturating_sub(1),
+                    Screen::Failures => fail_start = fail_start.saturating_sub(1),
+                },
+                KeyCode::Right | KeyCode::Char('l') => match screen {
+                    Screen::Usage => {
+                        window_start =
+                            (window_start + 1).min(report.rows.len().saturating_sub(max_visible));
+                    }
+                    Screen::Failures => {
+                        fail_start = (fail_start + 1)
+                            .min(failures.days.len().saturating_sub(fail_max_visible));
+                    }
+                },
                 KeyCode::Tab => metric_idx = (metric_idx + 1) % metrics.len(),
                 KeyCode::Char('b') => bars = !bars,
                 _ => {}
@@ -1095,7 +1239,7 @@ fn draw(
 
     let header = format!(
         "OpenCode usage   {span}\n\
-         {} {}   ←/→ slide window   Tab metric   b bars/line   q quit",
+         {} {}   ←/→ slide window   Tab metric   b bars/line   f tool failures   q quit",
         metric.text(&summed),
         metric.name(),
     );
@@ -1175,6 +1319,130 @@ fn draw(
                     .style(Style::default().dark_gray())
                     .labels(vec![metric.y_label(y0), metric.y_label(y1)])
                     .bounds([y0, y1]),
+            ),
+        chunks[1],
+    );
+}
+
+/// The failures screen: failed tool calls per day as bars (or a
+/// line), with the per-tool breakdown under the chart. Days are
+/// zero-filled, so a clean day shows as an empty bar rather than
+/// vanishing.
+fn draw_failures(
+    frame: &mut Frame,
+    failures: &ToolFailures,
+    window_start: usize,
+    max_visible: usize,
+    bars: bool,
+) {
+    let visible = &failures.days[window_start..window_start + max_visible];
+    let span = if visible.len() > 1 {
+        format!(
+            "{} … {}",
+            visible.first().unwrap().0,
+            visible.last().unwrap().0
+        )
+    } else {
+        visible
+            .first()
+            .map_or_else(|| "no days in range".to_string(), |(day, _)| day.clone())
+    };
+
+    let header = format!(
+        "OpenCode tool failures   {span}\n\
+         {} failed in range   ←/→ slide window   b bars/line   f usage   q quit",
+        failures.total,
+    );
+
+    let area = frame.area();
+    let chunks = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(3),
+        ratatui::layout::Constraint::Min(8),
+        ratatui::layout::Constraint::Length(2),
+    ])
+    .split(area);
+
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(header)
+            .alignment(Alignment::Center)
+            .style(Style::default().cyan()),
+        chunks[0],
+    );
+
+    let breakdown = if failures.by_tool.is_empty() {
+        "no failed tool calls in range".to_string()
+    } else {
+        let parts: Vec<String> = failures
+            .by_tool
+            .iter()
+            .map(|(tool, count)| format!("{tool} {count}"))
+            .collect();
+        format!("by tool: {}", parts.join(" · "))
+    };
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(breakdown)
+            .alignment(Alignment::Center)
+            .style(Style::default().dark_gray()),
+        chunks[2],
+    );
+
+    if visible.is_empty() {
+        return;
+    }
+
+    let color = Style::default().red();
+    let value_style = Style::default().white();
+    if bars {
+        let columns: Vec<Bar> = visible
+            .iter()
+            .map(|(day, count)| {
+                Bar::new(*count)
+                    .label(day[5..].to_string())
+                    .text_value(count.to_string())
+                    .style(color)
+            })
+            .collect();
+        render_bars(frame, chunks[1], &columns, value_style, BAR_WIDTH);
+        render_bar_legend(frame, chunks[1], "failed calls", color);
+        return;
+    }
+
+    let values: Vec<f64> = visible.iter().map(|(_, count)| *count as f64).collect();
+    let points: Vec<(f64, f64)> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as f64, *v))
+        .collect();
+    let max = values
+        .iter()
+        .copied()
+        .reduce(f64::max)
+        .unwrap_or(1.0)
+        .max(1.0);
+    let labels: Vec<String> = visible
+        .iter()
+        .map(|(day, _)| day[5..].to_string())
+        .collect();
+    let dataset = Dataset::default()
+        .name("failed calls")
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(color)
+        .data(&points);
+    frame.render_widget(
+        Chart::new(vec![dataset])
+            .x_axis(
+                Axis::default()
+                    .labels(labels.iter().map(|l| l.as_str()))
+                    .labels_alignment(Alignment::Center)
+                    .style(Style::default().dark_gray())
+                    .bounds([0.0, (values.len() - 1).max(1) as f64]),
+            )
+            .y_axis(
+                Axis::default()
+                    .style(Style::default().dark_gray())
+                    .labels(vec![format!("{:.0}", 0.0), format!("{:.0}", max * 1.15)])
+                    .bounds([0.0, max * 1.15]),
             ),
         chunks[1],
     );
@@ -1558,6 +1826,90 @@ mod tests {
         assert!(parse_fields("vibes").is_err());
         assert_eq!(parse_day("1970-01-02").unwrap(), DAY_MS);
         assert!(parse_day("2026-13-01").is_err());
+    }
+
+    #[test]
+    fn tool_failures_count_error_parts_by_day_and_tool() {
+        let path = scratch_db("tool-failures");
+        let conn = Connection::open(&path).unwrap();
+        let day = parse_day("2026-10-20").unwrap();
+        let hour = crate::AN_HOUR_IN_MS;
+        {
+            let raw = |at_ms: i64, data: String| {
+                conn.execute(
+                    "INSERT INTO session_message (type, data, time_created) \
+                     VALUES ('assistant', ?1, ?2)",
+                    params![data, at_ms],
+                )
+                .expect("insert");
+            };
+            // Day one: a failed edit (named by `tool`) beside a
+            // completed read in the same message.
+            raw(
+                day + hour,
+                serde_json::json!({
+                    "parts": [
+                        { "type": "tool", "tool": "edit",
+                          "state": { "status": "error", "error": "oldString not found" } },
+                        { "type": "tool", "tool": "read",
+                          "state": { "status": "completed" } },
+                    ]
+                })
+                .to_string(),
+            );
+            // Day two: a failed grep (named by `name`) inside a
+            // content array, and a failed bash in a later message.
+            raw(
+                day + DAY_MS + hour,
+                serde_json::json!({
+                    "content": [
+                        { "type": "tool", "name": "grep",
+                          "state": { "status": "error", "error": "invalid arguments" } },
+                    ]
+                })
+                .to_string(),
+            );
+            raw(
+                day + DAY_MS + 2 * hour,
+                serde_json::json!({
+                    "parts": [
+                        { "type": "tool", "tool": "bash",
+                          "state": { "status": "error", "error": "exit 1" } },
+                        // A lookalike nested in a completed call's
+                        // input is not a call and must not count.
+                        { "type": "tool", "tool": "read",
+                          "state": { "status": "completed",
+                                     "input": { "type": "tool",
+                                                "state": { "status": "error" } } } },
+                    ]
+                })
+                .to_string(),
+            );
+            // Malformed JSON is skipped, never fatal.
+            raw(day + 2 * hour, "{not json".to_string());
+        }
+        drop(conn);
+
+        let failures =
+            collect_tool_failures(&path, &query(day, day + 3 * DAY_MS)).expect("collect");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(failures.total, 3);
+        assert_eq!(
+            failures.days,
+            vec![
+                ("2026-10-20".to_string(), 1),
+                ("2026-10-21".to_string(), 2),
+                ("2026-10-22".to_string(), 0),
+            ]
+        );
+        assert_eq!(
+            failures.by_tool,
+            vec![
+                ("bash".to_string(), 1),
+                ("edit".to_string(), 1),
+                ("grep".to_string(), 1),
+            ]
+        );
     }
 
     #[test]
