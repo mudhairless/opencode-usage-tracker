@@ -25,6 +25,16 @@ The `stats` subcommand charts usage in the terminal: per UTC day, per model, or 
 
 ## Quick start
 
+The fastest route is a release binary: download the `.tar.gz` for your machine (x86_64 or aarch64) from the [releases page](https://github.com/mudhairless/opencode-usage-tracker/releases), extract it, and run the installer from the extracted binary. The binaries are static, so they run on any Linux distribution:
+
+```sh
+tar -xzf opencode-usage-tracker-*.tar.gz
+./opencode-usage-tracker install --autostart
+./opencode-usage-tracker
+```
+
+Or build from source:
+
 ```sh
 git clone https://github.com/mudhairless/opencode-usage-tracker.git
 cd opencode-usage-tracker
@@ -38,8 +48,7 @@ That is the whole setup for the default free plan: no configuration, no accounts
 ## Requirements
 
 - Linux with a system tray that implements StatusNotifierItem. Development targets KDE Plasma. See [Desktop support](#desktop-support) for other desktops, including GNOME.
-- Rust 1.88 or newer, because the code uses edition 2024 and let-chains.
-- A C compiler, because the bundled SQLite in `rusqlite` builds from source.
+- To build from source: Rust 1.88 or newer, because the code uses edition 2024 and let-chains, and a C compiler, because the bundled SQLite in `rusqlite` builds from source. The release binaries need neither.
 - OpenCode used on the same machine, so that its database exists.
 
 ## Desktop support
@@ -252,6 +261,15 @@ cargo test
 ```
 
 That gate is what a change has to pass; see [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `cargo build` and `cargo test` on every push and pull request to `main`. The tests cover the config file and its CLI, the tray text, the stats engine and chart, the Go price tables, and the installer, all against scratch databases.
+
+To cut a release: bump `version` in `Cargo.toml`, commit, then tag and push the tag:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The release workflow checks the tag against `Cargo.toml`, runs the tests, and publishes a GitHub release with static (musl) binaries for x86_64 and aarch64 plus SHA-256 checksums. The published binary installs itself with its `install` command, so no per-distribution packages are needed.
 
 Repository layout:
 
