@@ -1232,15 +1232,13 @@ fn draw(
             .first()
             .map_or_else(|| "no rows in range".to_string(), row_label)
     };
-    let mut summed = Metrics::default();
-    for row in visible {
-        summed.add(&row.metrics);
-    }
-
+    // The headline total is the report's own: every loaded row, the
+    // same figure --text and --json print. Sliding the window moves
+    // the bars, never the total.
     let header = format!(
         "OpenCode usage   {span}\n\
          {} {}   ←/→ slide window   Tab metric   b bars/line   f tool failures   q quit",
-        metric.text(&summed),
+        metric.text(&report.totals),
         metric.name(),
     );
 
