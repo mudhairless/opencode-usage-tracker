@@ -23,6 +23,10 @@ The tracker runs no INSERT, UPDATE, or DELETE statements, and it makes no networ
 
 The `stats` subcommand charts usage in the terminal: per UTC day, per model, or both, with token and cost breakdowns.
 
+![The stats charts: tokens per day, requests per day, and tool failures per day](images/stats-charts.png)
+
+Full size: [tokens per day](images/stats-tokens.png), [requests per day](images/stats-requests.png), [tool failures per day](images/tool-failures.png).
+
 ## Quick start
 
 The fastest route is a release binary: download the `.tar.gz` for your machine (x86_64 or aarch64) from the [releases page](https://github.com/mudhairless/opencode-usage-tracker/releases), extract it, and run the installer from the extracted binary. The binaries are static, so they run on any Linux distribution:
