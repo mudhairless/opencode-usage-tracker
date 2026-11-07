@@ -432,7 +432,9 @@ pub fn price(model: &GoModel, tokens: Tokens, created_ms: i64) -> f64 {
 /// current billing cycle when a reset date is configured, and a
 /// rolling 30 days otherwise. `priced` is false when the model is
 /// outside the published table: its usage is real but cannot be
-/// turned into dollars here.
+/// turned into dollars here. `first_5h_ms` is when this model's
+/// oldest usage inside the current 5-hour window landed: the window
+/// starts with usage, so that stamp plus 5 hours is when it resets.
 #[derive(Clone, Debug, Default)]
 pub struct ModelUsage {
     pub name: String,
@@ -441,6 +443,7 @@ pub struct ModelUsage {
     pub used_week: f64,
     pub used_month: f64,
     pub monthly_limit: Option<f64>,
+    pub first_5h_ms: Option<i64>,
 }
 
 impl ModelUsage {
@@ -451,6 +454,12 @@ impl ModelUsage {
         Some(self.used_5h / (self.monthly_limit? * 0.2))
     }
 
+    /// The weekly window's share of its limit (50% of the monthly
+    /// limit). `None` when no limit is published for this model.
+    pub fn ratio_week(&self) -> Option<f64> {
+        Some(self.used_week / (self.monthly_limit? * 0.5))
+    }
+
     /// The monthly window's share of its limit. `None` when no limit
     /// is published for this model.
     pub fn monthly_ratio(&self) -> Option<f64> {
@@ -458,19 +467,53 @@ impl ModelUsage {
     }
 }
 
-/// The tightest 5-hour window across models: the highest ratio and
-/// the model at it. The tray light follows this one window; the
-/// weekly and monthly figures are context for the hover and menu.
-pub fn worst_5h_ratio(usages: &[ModelUsage]) -> Option<(f64, &ModelUsage)> {
-    let mut best: Option<(f64, &ModelUsage)> = None;
+/// A window's composite ratio: every model's share of its own
+/// limit, added across models. The Zen console's windows behave
+/// this way in practice (verified 2026-11-07 against the console
+/// and a real cutoff): spend on one model counts toward the same
+/// window as spend on another, weighted by each model's limit, so
+/// there is one shared window per period rather than one allowance
+/// per model. `None` when no model in the list has a published
+/// limit.
+fn composite_ratio(usages: &[ModelUsage], ratio: fn(&ModelUsage) -> Option<f64>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut any = false;
     for usage in usages {
-        if let Some(ratio) = usage.ratio_5h()
-            && best.is_none_or(|(r, _)| ratio > r)
-        {
-            best = Some((ratio, usage));
+        if let Some(share) = ratio(usage) {
+            total += share;
+            any = true;
         }
     }
-    best
+    any.then_some(total)
+}
+
+/// The 5-hour window's composite ratio: the one the tray light
+/// follows.
+pub fn composite_5h_ratio(usages: &[ModelUsage]) -> Option<f64> {
+    composite_ratio(usages, ModelUsage::ratio_5h)
+}
+
+/// The weekly window's composite ratio.
+pub fn composite_week_ratio(usages: &[ModelUsage]) -> Option<f64> {
+    composite_ratio(usages, ModelUsage::ratio_week)
+}
+
+/// The monthly window's composite ratio.
+pub fn composite_month_ratio(usages: &[ModelUsage]) -> Option<f64> {
+    composite_ratio(usages, ModelUsage::monthly_ratio)
+}
+
+/// When the current 5-hour window resets: the oldest usage still
+/// inside it, plus 5 hours. The window starts with usage rather
+/// than on a clock boundary, and the stamps are epoch milliseconds,
+/// so a window straddling midnight UTC needs no special case.
+/// `None` when nothing has landed in the window.
+pub fn window_reset_ms(usages: &[ModelUsage]) -> Option<i64> {
+    usages
+        .iter()
+        .filter_map(|u| u.first_5h_ms)
+        .min()
+        .map(|start| start + 5 * HOUR_MS)
 }
 
 /// Price Go usage from the local database, grouped by model. The
@@ -557,6 +600,10 @@ pub fn collect_usage(
         }
         if created >= five_h_start {
             usage.used_5h += value;
+            usage.first_5h_ms = Some(match usage.first_5h_ms {
+                Some(first) => first.min(created),
+                None => created,
+            });
         }
     }
     Some(by_model.into_values().collect())
@@ -784,14 +831,15 @@ mod tests {
     }
 
     #[test]
-    fn window_ratios_and_the_worst_5h() {
-        let mut a = ModelUsage {
+    fn window_ratios_and_the_composite() {
+        let a = ModelUsage {
             name: "A".to_string(),
             priced: true,
             used_5h: 1.0,
             used_week: 20.0,
             used_month: 30.0,
             monthly_limit: Some(60.0),
+            first_5h_ms: None,
         };
         // Monthly: 30 / 60 = 0.5. 5-hour: 1 / (60 * 0.2).
         close(a.monthly_ratio().unwrap(), 0.5);
@@ -801,10 +849,74 @@ mod tests {
             ..a.clone()
         };
         assert!(b.ratio_5h().is_none());
-        a.used_5h = 12.0; // exactly the 5-hour limit of 12
-        let usages = [a, b];
-        let (ratio, usage) = worst_5h_ratio(&usages).unwrap();
-        close(ratio, 1.0);
-        assert_eq!(usage.name, "A");
+        // A model without a limit never counts toward a composite.
+        close(composite_5h_ratio(&[a.clone(), b]).unwrap(), 1.0 / 12.0);
+        // Two $60 models reproduce the 2026-11-07 console figures:
+        // $4.13 and $7.89 against $12 caps fill the 5-hour window
+        // between them, and the week and month pool the same way.
+        let g = ModelUsage {
+            name: "G".to_string(),
+            used_5h: 4.13,
+            used_week: 10.88,
+            used_month: 10.88,
+            first_5h_ms: Some(2_000),
+            ..a.clone()
+        };
+        let k = ModelUsage {
+            name: "K".to_string(),
+            used_5h: 7.89,
+            used_week: 7.89,
+            used_month: 7.89,
+            first_5h_ms: Some(1_000),
+            ..a.clone()
+        };
+        let usages = [g, k];
+        close(composite_5h_ratio(&usages).unwrap(), 12.02 / 12.0);
+        close(composite_week_ratio(&usages).unwrap(), 18.77 / 30.0);
+        close(composite_month_ratio(&usages).unwrap(), 18.77 / 60.0);
+        // The reset follows the oldest usage in the window.
+        assert_eq!(window_reset_ms(&usages), Some(1_000 + 5 * HOUR_MS));
+        // No limits anywhere: no composite, no reset.
+        let unpriced = [ModelUsage::default()];
+        assert!(composite_5h_ratio(&unpriced).is_none());
+        assert!(window_reset_ms(&unpriced).is_none());
+    }
+
+    #[test]
+    fn collect_usage_window_start_crosses_utc_midnight() {
+        let path = scratch_db("midnight");
+        let conn = Connection::open(&path).unwrap();
+        let now = ms("2026-11-07T02:30:00Z");
+        // Inside the 5-hour window, on the far side of midnight UTC.
+        insert(
+            &conn,
+            ms("2026-11-06T23:15:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        insert(
+            &conn,
+            ms("2026-11-07T01:00:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        // Inside the week but outside the 5-hour window.
+        insert(
+            &conn,
+            ms("2026-11-06T20:00:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        drop(conn);
+        let usages = collect_usage(&path, config::GoTier::Go, now, None).expect("collect");
+        let _ = std::fs::remove_file(&path);
+        let kimi = usages.iter().find(|u| u.name == "Kimi K2.7 Code").unwrap();
+        close(kimi.used_5h, 1.90);
+        close(kimi.used_week, 2.85);
+        assert_eq!(kimi.first_5h_ms, Some(ms("2026-11-06T23:15:00Z")));
+        assert_eq!(window_reset_ms(&usages), Some(ms("2026-11-07T04:15:00Z")));
     }
 }

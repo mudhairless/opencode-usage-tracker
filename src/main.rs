@@ -42,7 +42,7 @@ const SPIN_FRAMES: u8 = 8;
 const ARC: f32 = 2.1; // radians of ring lit behind the head (~120°)
 const YELLOW_AT: u32 = 50;
 const RED_AT: u32 = 75;
-/// Go mode turns yellow at this fraction of any window's limit.
+/// Go mode turns yellow at this fraction of the 5-hour window.
 const GO_YELLOW_RATIO: f64 = 0.8;
 const ICON_SIZE: i32 = 44;
 const THROBBER_THICKNESS: f32 = 2.4;
@@ -167,6 +167,30 @@ fn reset_local_time() -> String {
             .format("%-I:%M %p")
             .to_string(),
         None => "midnight UTC".to_string(),
+    }
+}
+
+/// An epoch-millisecond stamp in the machine's local time, e.g.
+/// "6:36 PM" — the same format as the free pool's reset line.
+fn local_time_text(ms: i64) -> String {
+    match chrono::DateTime::from_timestamp_millis(ms) {
+        Some(utc) => utc
+            .with_timezone(&chrono::Local)
+            .format("%-I:%M %p")
+            .to_string(),
+        None => "?".to_string(),
+    }
+}
+
+/// The span until a reset, in the console's own phrasing shape:
+/// "3h 43m", "43m", "under a minute".
+fn countdown_text(until_ms: i64, now: i64) -> String {
+    let minutes = (until_ms - now).max(0) / 60_000;
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => "under a minute".to_string(),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
     }
 }
 
@@ -515,7 +539,7 @@ struct UsageTray {
     spend: Option<f64>,
     runway: Option<f64>,
     go: Option<Vec<go::ModelUsage>>,
-    go_notified: std::collections::HashSet<String>,
+    go_month_notified: bool,
     running: bool,
     working: bool,
     frame: u8,
@@ -550,10 +574,10 @@ impl UsageTray {
         self.check_go_limit();
     }
 
-    /// Fire the monthly-limit notification for any Go model that has
-    /// newly reached its limit, and re-arm the ones back under it.
-    /// The latch lives in the tray, so a restart notifies once more —
-    /// the same behavior class as the balance reminder.
+    /// Fire the monthly-limit notification when the shared monthly
+    /// window fills, and re-arm once it drops back under. The latch
+    /// lives in the tray, so a restart notifies once more — the same
+    /// behavior class as the balance reminder.
     fn check_go_limit(&mut self) {
         if self.config.plan != config::Plan::Go || !self.config.go_limit_notify {
             return;
@@ -561,17 +585,14 @@ impl UsageTray {
         let Some(usages) = self.go.clone() else {
             return;
         };
-        self.go_notified.retain(|name| {
-            usages
-                .iter()
-                .any(|u| &u.name == name && u.monthly_ratio().is_some_and(|r| r >= 1.0))
-        });
-        let anchored = self.config.cycle_start_ms(now_ms().unwrap_or(0)).is_some();
-        for name in newly_capped(&usages, &self.go_notified) {
-            self.go_notified.insert(name.clone());
-            if let Some(usage) = usages.iter().find(|u| u.name == name) {
-                notify_go_limit(usage, anchored);
+        if go_monthly_capped(&usages) {
+            if !self.go_month_notified {
+                self.go_month_notified = true;
+                let anchored = self.config.cycle_start_ms(now_ms().unwrap_or(0)).is_some();
+                notify_go_monthly(anchored);
             }
+        } else {
+            self.go_month_notified = false;
         }
     }
     fn level(&self) -> Level {
@@ -587,9 +608,9 @@ impl UsageTray {
                 // the only honest signal left.
                 _ => level_for(self.count),
             },
-            config::Plan::Go => match self.go.as_deref().and_then(go::worst_5h_ratio) {
-                Some((ratio, _)) if ratio >= 1.0 => Level::Red,
-                Some((ratio, _)) if ratio >= GO_YELLOW_RATIO => Level::Yellow,
+            config::Plan::Go => match self.go.as_deref().and_then(go::composite_5h_ratio) {
+                Some(ratio) if ratio >= 1.0 => Level::Red,
+                Some(ratio) if ratio >= GO_YELLOW_RATIO => Level::Yellow,
                 Some(_) => Level::Green,
                 // No priced Go usage to judge: fall back to the free
                 // counts, same as credit mode does without a balance.
@@ -621,9 +642,10 @@ impl UsageTray {
         }
     }
 
-    /// The Go-mode hover line: the tightest 5-hour window across
-    /// priced models (the one the light follows), or why there isn't
-    /// one. Only called when the plan is Go.
+    /// The Go-mode hover line: the shared 5-hour window's composite
+    /// percentage (the one the light follows) and when the window
+    /// resets, or why there isn't one. Only called when the plan is
+    /// Go.
     fn go_line(&self) -> String {
         let Some(usages) = &self.go else {
             return "\nGo usage unavailable".to_string();
@@ -631,15 +653,17 @@ impl UsageTray {
         if usages.is_empty() {
             return "\nNo Go usage in the last 30 days".to_string();
         }
-        match go::worst_5h_ratio(usages) {
-            Some((ratio, usage)) => {
-                let limit = usage.monthly_limit.unwrap_or(0.0) * 0.2;
-                format!(
-                    "\nGo: {} ${:.2} of ${limit:.2} ({:.0}%, last 5 hours)",
-                    usage.name,
-                    usage.used_5h,
+        match go::composite_5h_ratio(usages) {
+            Some(ratio) => {
+                let spent: f64 = usages.iter().map(|u| u.used_5h).sum();
+                let mut line = format!(
+                    "\nGo: {:.0}% of the 5-hour window used (${spent:.2} spent)",
                     ratio * 100.0
-                )
+                );
+                if let Some(reset) = go::window_reset_ms(usages) {
+                    line.push_str(&format!(", resets {}", local_time_text(reset)));
+                }
+                line
             }
             None => "\nGo usage not priced (outside the published table)".to_string(),
         }
@@ -761,6 +785,31 @@ impl UsageTray {
                     match &self.go {
                         Some(usages) if !usages.is_empty() => {
                             s.push_str("\nGo usage (estimated from token prices):");
+                            if let Some(ratio) = go::composite_5h_ratio(usages) {
+                                let spent: f64 = usages.iter().map(|u| u.used_5h).sum();
+                                let mut line = format!(
+                                    "\n5-hour window: {:.0}% used · ${spent:.2} spent",
+                                    ratio * 100.0
+                                );
+                                if let Some(reset) = go::window_reset_ms(usages) {
+                                    line.push_str(&format!(
+                                        " · resets {} (in {})",
+                                        local_time_text(reset),
+                                        countdown_text(reset, now_ms().unwrap_or(0))
+                                    ));
+                                }
+                                s.push_str(&line);
+                            }
+                            if let (Some(week), Some(month)) = (
+                                go::composite_week_ratio(usages),
+                                go::composite_month_ratio(usages),
+                            ) {
+                                s.push_str(&format!(
+                                    "\nWeekly window: {:.0}% used · monthly window ({month_label}): {:.0}% used",
+                                    week * 100.0,
+                                    month * 100.0
+                                ));
+                            }
                             for usage in usages {
                                 if !usage.priced {
                                     s.push_str(&format!(
@@ -1200,26 +1249,18 @@ fn balance_stale(config: &config::Config, now: chrono::DateTime<chrono::Utc>) ->
     set_at.timestamp_millis() < utc_day_start_ms(now.timestamp_millis())
 }
 
-/// Models at or over their monthly limit that are not already
-/// latched in `notified`. Pure so the latch rule is testable without
-/// a notification daemon.
-fn newly_capped(
-    usages: &[go::ModelUsage],
-    notified: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    usages
-        .iter()
-        .filter(|u| u.monthly_ratio().is_some_and(|r| r >= 1.0) && !notified.contains(&u.name))
-        .map(|u| u.name.clone())
-        .collect()
+/// Whether the shared monthly window has filled: every model's
+/// share of its own limit, added across models, at or over the
+/// whole. Pure so the rule is testable without a notification
+/// daemon.
+fn go_monthly_capped(usages: &[go::ModelUsage]) -> bool {
+    go::composite_month_ratio(usages).is_some_and(|r| r >= 1.0)
 }
 
-/// Show the Go monthly-limit notification: one model has reached the
-/// end of its allowance. No action button — the news is the point —
+/// Show the Go monthly-limit notification: the shared monthly
+/// window is used up. No action button — the news is the point —
 /// and spawned so the poll loop never waits on it.
-fn notify_go_limit(usage: &go::ModelUsage, anchored: bool) {
-    let name = usage.name.clone();
-    let limit = usage.monthly_limit.unwrap_or(0.0);
+fn notify_go_monthly(anchored: bool) {
     tokio::spawn(async move {
         let window = if anchored {
             " for this billing cycle"
@@ -1229,8 +1270,9 @@ fn notify_go_limit(usage: &go::ModelUsage, anchored: bool) {
         let _ = notify_rust::Notification::new()
             .summary("OpenCode Go monthly limit reached")
             .body(&format!(
-                "{name} has reached its Go monthly limit of ${limit:.2}{window}. \
-                 Other models keep their own allowances, and the free models remain available."
+                "The Go monthly window is used up{window}. The window is a \
+                 composite across models, so it can fill before any one model \
+                 reaches its own limit. The free models remain available."
             ))
             .show_async()
             .await;
@@ -1469,7 +1511,7 @@ async fn main() {
             spend: None,
             runway: None,
             go: None,
-            go_notified: std::collections::HashSet::new(),
+            go_month_notified: false,
             running: false,
             working: false,
             frame: 0,
@@ -1496,7 +1538,7 @@ async fn main() {
         spend: None,
         runway: None,
         go: None,
-        go_notified: std::collections::HashSet::new(),
+        go_month_notified: false,
         running: false,
         working: false,
         frame: 0,
@@ -1613,7 +1655,7 @@ mod tests {
             spend: None,
             runway: None,
             go: None,
-            go_notified: std::collections::HashSet::new(),
+            go_month_notified: false,
             running,
             working: false,
             frame: 0,
@@ -1730,15 +1772,17 @@ mod tests {
             used_week: 0.0,
             used_month: 30.0, // half the $60 monthly limit: context, not the light
             monthly_limit: Some(60.0),
+            first_5h_ms: None,
         }]);
         assert!(t.level() == Level::Green);
         assert!(
             t.hover()
                 .title
-                .contains("\nGo: Kimi K2.7 Code $0.00 of $12.00 (0%, last 5 hours)")
+                .contains("\nGo: 0% of the 5-hour window used ($0.00 spent)")
         );
         let summary = t.summary();
         assert!(summary.contains("Go usage (estimated from token prices):"));
+        assert!(summary.contains("5-hour window: 0% used · $0.00 spent"));
         assert!(summary.contains("Kimi K2.7 Code: $30.00 of $60.00 last 30 days"));
         t.go.as_mut().unwrap()[0].used_5h = 10.0; // 10 / 12 = 83% of the 5-hour window
         assert!(t.level() == Level::Yellow);
@@ -1747,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn go_limit_latch_fires_once_per_crossing() {
+    fn go_monthly_cap_is_a_composite_across_models() {
         let usage = |name: &str, used_month: f64| go::ModelUsage {
             name: name.to_string(),
             priced: true,
@@ -1755,14 +1799,24 @@ mod tests {
             used_week: 0.0,
             used_month,
             monthly_limit: Some(60.0),
+            first_5h_ms: None,
         };
-        let usages = vec![usage("A", 60.0), usage("B", 30.0)];
-        let mut notified = std::collections::HashSet::new();
-        // A is at its limit, B is not.
-        assert_eq!(newly_capped(&usages, &notified), vec!["A".to_string()]);
-        notified.insert("A".to_string());
-        // Latched: no second firing while A stays over.
-        assert!(newly_capped(&usages, &notified).is_empty());
+        // Neither model is at its own limit, but their shares add
+        // past the whole window: capped.
+        assert!(go_monthly_capped(&[usage("A", 40.0), usage("B", 25.0)]));
+        // Under the whole between them: not capped.
+        assert!(!go_monthly_capped(&[usage("A", 30.0), usage("B", 20.0)]));
+        // One model at its own limit still caps the window.
+        assert!(go_monthly_capped(&[usage("A", 60.0)]));
+    }
+
+    #[test]
+    fn countdown_text_bands() {
+        assert_eq!(countdown_text(0, 0), "under a minute");
+        assert_eq!(countdown_text(43 * 60_000, 0), "43m");
+        assert_eq!(countdown_text(60 * 60_000, 0), "1h");
+        assert_eq!(countdown_text(223 * 60_000, 0), "3h 43m");
+        assert_eq!(countdown_text(0, 5_000), "under a minute");
     }
 
     #[test]

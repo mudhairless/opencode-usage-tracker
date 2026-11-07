@@ -81,7 +81,9 @@ tier = "go"
 #     opencode-usage-tracker config go.cycle_reset 2026-11-15
 # cycle_reset = 2026-11-15
 
-# Show a desktop notification when a model reaches its monthly limit.
+# Show a desktop notification when the shared monthly window fills.
+# The window is a composite across models: each model's spend counts
+# as a fraction of its own limit and the fractions add up.
 # Set this to false to silence it.
 limit_notify = true
 "#;
