@@ -517,9 +517,10 @@ pub fn window_reset_ms(usages: &[ModelUsage]) -> Option<i64> {
 }
 
 /// Price Go usage from the local database, grouped by model. The
-/// weekly and monthly windows end at `now_ms` (7 days back, and the
-/// monthly window, which starts at `cycle_start_ms` when a billing
-/// cycle is configured and 30 days back otherwise). The 5-hour
+/// weekly window is the current UTC calendar week, from Monday
+/// 00:00 UTC; the monthly window ends at `now_ms` and starts at
+/// `cycle_start_ms` when a billing cycle is configured, 30 days
+/// back otherwise. The 5-hour
 /// window is a block: it opens with the first priced usage after
 /// the previous block closed and empties all at once 5 hours later,
 /// which is how the console treats it. Mirrors the tracker's
@@ -537,7 +538,12 @@ pub fn collect_usage(
     // window's or 30 days, so the weekly window is covered either way.
     let month_start = cycle_start_ms.unwrap_or(now_ms - 30 * DAY_MS);
     let read_start = month_start.min(now_ms - 30 * DAY_MS);
-    let week_start = now_ms - 7 * DAY_MS;
+    // The weekly window is a calendar week in UTC, Monday 00:00 to
+    // Monday 00:00: the console's reset countdown lands on that
+    // boundary to the minute (observed 2026-11-07). Epoch day 0 was
+    // a Thursday, so (days + 3) % 7 counts the days since Monday.
+    let days = now_ms.div_euclid(DAY_MS);
+    let week_start = (days - (days + 3).rem_euclid(7)) * DAY_MS;
     let mut stmt = conn
         .prepare(
             "SELECT type, data, time_created FROM session_message \
@@ -1009,5 +1015,36 @@ mod tests {
         close(kimi.used_5h, 0.95);
         assert_eq!(kimi.first_5h_ms, Some(ms("2026-11-07T18:39:00Z")));
         assert_eq!(window_reset_ms(&usages), Some(ms("2026-11-07T23:39:00Z")));
+    }
+
+    #[test]
+    fn collect_usage_week_starts_monday_utc() {
+        let path = scratch_db("week");
+        let conn = Connection::open(&path).unwrap();
+        // A Sunday: the current week opened Monday Nov 2, 00:00 UTC.
+        let now = ms("2026-11-08T12:00:00Z");
+        // Last week: outside the calendar week, though under 7 days
+        // old, so a rolling span would wrongly count it.
+        insert(
+            &conn,
+            ms("2026-11-01T23:30:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        // This week, half an hour in.
+        insert(
+            &conn,
+            ms("2026-11-02T00:30:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        drop(conn);
+        let usages = collect_usage(&path, config::GoTier::Go, now, None).expect("collect");
+        let _ = std::fs::remove_file(&path);
+        let kimi = usages.iter().find(|u| u.name == "Kimi K2.7 Code").unwrap();
+        close(kimi.used_week, 0.95);
+        close(kimi.used_month, 1.90);
     }
 }

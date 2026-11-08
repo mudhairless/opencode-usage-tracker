@@ -818,7 +818,7 @@ impl UsageTray {
                                     ));
                                 } else if let Some(limit) = usage.monthly_limit {
                                     s.push_str(&format!(
-                                        "\n{}: ${:.2} of ${limit:.2} {month_label} · ${:.2} last 7 days · ${:.2} last 5 hours",
+                                        "\n{}: ${:.2} of ${limit:.2} {month_label} · ${:.2} this week · ${:.2} in the 5-hour window",
                                         usage.name, usage.used_month, usage.used_week, usage.used_5h
                                     ));
                                 } else {
