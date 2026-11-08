@@ -517,9 +517,12 @@ pub fn window_reset_ms(usages: &[ModelUsage]) -> Option<i64> {
 }
 
 /// Price Go usage from the local database, grouped by model. The
-/// windows end at `now_ms`: 5 hours, 7 days, and the monthly window,
-/// which starts at `cycle_start_ms` when a billing cycle is
-/// configured and 30 days back otherwise. Mirrors the tracker's
+/// weekly and monthly windows end at `now_ms` (7 days back, and the
+/// monthly window, which starts at `cycle_start_ms` when a billing
+/// cycle is configured and 30 days back otherwise). The 5-hour
+/// window is a block: it opens with the first priced usage after
+/// the previous block closed and empties all at once 5 hours later,
+/// which is how the console treats it. Mirrors the tracker's
 /// counting rules: assistant rows that never finished are skipped,
 /// compaction rows count as-is. `None` when the database can't be
 /// read.
@@ -535,7 +538,6 @@ pub fn collect_usage(
     let month_start = cycle_start_ms.unwrap_or(now_ms - 30 * DAY_MS);
     let read_start = month_start.min(now_ms - 30 * DAY_MS);
     let week_start = now_ms - 7 * DAY_MS;
-    let five_h_start = now_ms - 5 * HOUR_MS;
     let mut stmt = conn
         .prepare(
             "SELECT type, data, time_created FROM session_message \
@@ -553,6 +555,10 @@ pub fn collect_usage(
         .ok()?;
 
     let mut by_model: BTreeMap<String, ModelUsage> = BTreeMap::new();
+    // Every priced row, kept for the 5-hour block walk below: which
+    // rows belong to the live block depends on the blocks before it,
+    // so the 5-hour figures cannot be bucketed in this pass.
+    let mut priced_rows: Vec<(i64, String, f64)> = Vec::new();
     for row in rows {
         let Ok((msg_type, data, created)) = row else {
             continue;
@@ -598,12 +604,33 @@ pub fn collect_usage(
         if created >= week_start {
             usage.used_week += value;
         }
-        if created >= five_h_start {
-            usage.used_5h += value;
-            usage.first_5h_ms = Some(match usage.first_5h_ms {
-                Some(first) => first.min(created),
-                None => created,
-            });
+        priced_rows.push((created, id, value));
+    }
+    // Find the live 5-hour block, if any: walk the priced rows in
+    // time order, opening a new block at the first row that lands
+    // at or after the open block's end, and keep the last block when
+    // it has not closed yet. Only its rows count toward the 5-hour
+    // figures.
+    priced_rows.sort_by_key(|(created, _, _)| *created);
+    let mut block_start: Option<i64> = None;
+    for (created, _, _) in &priced_rows {
+        match block_start {
+            Some(start) if *created < start + 5 * HOUR_MS => {}
+            _ => block_start = Some(*created),
+        }
+    }
+    if let Some(start) = block_start.filter(|&start| start + 5 * HOUR_MS > now_ms) {
+        for (created, id, value) in &priced_rows {
+            if *created >= start
+                && *created < start + 5 * HOUR_MS
+                && let Some(usage) = by_model.get_mut(id)
+            {
+                usage.used_5h += *value;
+                usage.first_5h_ms = Some(match usage.first_5h_ms {
+                    Some(first) => first.min(*created),
+                    None => *created,
+                });
+            }
         }
     }
     Some(by_model.into_values().collect())
@@ -902,10 +929,11 @@ mod tests {
             "kimi-k2.7-code",
             true,
         );
-        // Inside the week but outside the 5-hour window.
+        // Inside the week, in a 5-hour block that closed before the
+        // current one opened.
         insert(
             &conn,
-            ms("2026-11-06T20:00:00Z"),
+            ms("2026-11-06T15:00:00Z"),
             "opencode-go",
             "kimi-k2.7-code",
             true,
@@ -918,5 +946,68 @@ mod tests {
         close(kimi.used_week, 2.85);
         assert_eq!(kimi.first_5h_ms, Some(ms("2026-11-06T23:15:00Z")));
         assert_eq!(window_reset_ms(&usages), Some(ms("2026-11-07T04:15:00Z")));
+    }
+
+    #[test]
+    fn collect_usage_5h_window_empties_at_block_end() {
+        let path = scratch_db("blockend");
+        let conn = Connection::open(&path).unwrap();
+        let now = ms("2026-11-07T18:40:00Z");
+        // A block that opened at 13:36 and filled. Both rows are
+        // under 5 hours old, but the block closed at 18:36, so the
+        // 5-hour window reads empty (the console's behavior on
+        // 2026-11-07, where the tray's sliding span still read 95%).
+        insert(
+            &conn,
+            ms("2026-11-07T13:36:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        insert(
+            &conn,
+            ms("2026-11-07T14:30:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        drop(conn);
+        let usages = collect_usage(&path, config::GoTier::Go, now, None).expect("collect");
+        let _ = std::fs::remove_file(&path);
+        let kimi = usages.iter().find(|u| u.name == "Kimi K2.7 Code").unwrap();
+        close(kimi.used_5h, 0.0);
+        close(kimi.used_week, 1.90);
+        assert_eq!(kimi.first_5h_ms, None);
+        assert_eq!(window_reset_ms(&usages), None);
+    }
+
+    #[test]
+    fn collect_usage_new_block_opens_with_next_usage() {
+        let path = scratch_db("newblock");
+        let conn = Connection::open(&path).unwrap();
+        let now = ms("2026-11-07T18:40:00Z");
+        // The closed 13:36 block, then one fresh request a minute
+        // ago: a new block opens with it, and only it counts.
+        insert(
+            &conn,
+            ms("2026-11-07T13:36:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        insert(
+            &conn,
+            ms("2026-11-07T18:39:00Z"),
+            "opencode-go",
+            "kimi-k2.7-code",
+            true,
+        );
+        drop(conn);
+        let usages = collect_usage(&path, config::GoTier::Go, now, None).expect("collect");
+        let _ = std::fs::remove_file(&path);
+        let kimi = usages.iter().find(|u| u.name == "Kimi K2.7 Code").unwrap();
+        close(kimi.used_5h, 0.95);
+        assert_eq!(kimi.first_5h_ms, Some(ms("2026-11-07T18:39:00Z")));
+        assert_eq!(window_reset_ms(&usages), Some(ms("2026-11-07T23:39:00Z")));
     }
 }
