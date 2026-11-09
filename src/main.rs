@@ -1172,11 +1172,16 @@ fn terminal_argv(exe: &str, found: &dyn Fn(&str) -> bool) -> Option<Vec<String>>
 /// silently when nothing fits, but a menu click that does nothing
 /// reads as a broken menu, so a missing terminal — or one that will
 /// not start — is reported like the config file's failures are.
+///
+/// The terminal launcher is spawned detached (null stdio), like a
+/// `.desktop` `Exec=` line: the tray's own stdio (the session's
+/// journal socket) must not be inherited by the GUI child.
 fn open_stats() {
     let exe = std::env::current_exe()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "opencode-usage-tracker".to_string());
     let Some(argv) = terminal_argv(&exe, &|program| find_on_path(program).is_some()) else {
+        eprintln!("opencode-usage-tracker: open stats: no suitable terminal found");
         report_problem(
             "OpenCode usage",
             "could not open stats: no suitable terminal found (looked for \
@@ -1185,10 +1190,21 @@ fn open_stats() {
         );
         return;
     };
+    eprintln!(
+        "opencode-usage-tracker: open stats: launching {}",
+        argv.join(" ")
+    );
     if let Err(error) = std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
     {
+        eprintln!(
+            "opencode-usage-tracker: open stats: failed to launch {}: {error}",
+            argv[0]
+        );
         report_problem(
             "OpenCode usage",
             &format!("could not open stats in {}: {error}", argv[0]),
