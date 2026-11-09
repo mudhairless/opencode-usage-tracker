@@ -1,6 +1,6 @@
 [package]
 name = "opencode-usage-tracker"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "KDE Plasma tray icon that tracks OpenCode Zen free-tier usage"
