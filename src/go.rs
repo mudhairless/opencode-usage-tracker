@@ -373,6 +373,14 @@ pub struct Tokens {
     pub cache_write: u64,
 }
 
+impl Tokens {
+    /// All five buckets added up: the figure the console's Tokens
+    /// total reports for a model.
+    fn total(&self) -> u64 {
+        self.input + self.output + self.reasoning + self.cache_read + self.cache_write
+    }
+}
+
 fn tokens_of(v: &serde_json::Value) -> Tokens {
     let bucket =
         |n: &serde_json::Value, key: &str| n.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -435,6 +443,9 @@ pub fn price(model: &GoModel, tokens: Tokens, created_ms: i64) -> f64 {
 /// turned into dollars here. `first_5h_ms` is when this model's
 /// oldest usage inside the current 5-hour window landed: the window
 /// starts with usage, so that stamp plus 5 hours is when it resets.
+/// `tokens_today` is the model's total tokens since 00:00 UTC,
+/// counted for priced and unpriced models alike: the day's raw
+/// volume, which the dollar figures hide for the $0 pool models.
 #[derive(Clone, Debug, Default)]
 pub struct ModelUsage {
     pub name: String,
@@ -444,6 +455,7 @@ pub struct ModelUsage {
     pub used_month: f64,
     pub monthly_limit: Option<f64>,
     pub first_5h_ms: Option<i64>,
+    pub tokens_today: u64,
 }
 
 impl ModelUsage {
@@ -544,6 +556,7 @@ pub fn collect_usage(
     // a Thursday, so (days + 3) % 7 counts the days since Monday.
     let days = now_ms.div_euclid(DAY_MS);
     let week_start = (days - (days + 3).rem_euclid(7)) * DAY_MS;
+    let day_start = days * DAY_MS;
     let mut stmt = conn
         .prepare(
             "SELECT type, data, time_created FROM session_message \
@@ -600,10 +613,14 @@ pub fn collect_usage(
             monthly_limit: known.and_then(|m| monthly_limit(m, plan)),
             ..ModelUsage::default()
         });
+        let tokens = tokens_of(&v);
+        if created >= day_start {
+            usage.tokens_today += tokens.total();
+        }
         let Some(known) = known else {
             continue;
         };
-        let value = price(known, tokens_of(&v), created);
+        let value = price(known, tokens, created);
         if created >= month_start {
             usage.used_month += value;
         }
@@ -813,11 +830,14 @@ mod tests {
         close(kimi.used_week, 1.90);
         close(kimi.used_month, 2.85);
         assert_eq!(kimi.monthly_limit, Some(60.0));
+        assert_eq!(kimi.tokens_today, 1_000_000);
         let cat = usages.iter().find(|u| u.name == "cat-jam-free").unwrap();
         assert!(!cat.priced);
         assert_eq!(cat.monthly_limit, None);
         assert!(cat.monthly_ratio().is_none());
         assert!(cat.ratio_5h().is_none());
+        // Unpriced, but its tokens today still count.
+        assert_eq!(cat.tokens_today, 1_000_000);
 
         // The same usage under the other plans: Teams adds $5, Plus uses
         // its own published figure for this model.
@@ -873,6 +893,7 @@ mod tests {
             used_month: 30.0,
             monthly_limit: Some(60.0),
             first_5h_ms: None,
+            tokens_today: 0,
         };
         // Monthly: 30 / 60 = 0.5. 5-hour: 1 / (60 * 0.2).
         close(a.monthly_ratio().unwrap(), 0.5);
@@ -1046,5 +1067,41 @@ mod tests {
         let kimi = usages.iter().find(|u| u.name == "Kimi K2.7 Code").unwrap();
         close(kimi.used_week, 0.95);
         close(kimi.used_month, 1.90);
+    }
+
+    #[test]
+    fn collect_usage_tokens_today_starts_at_utc_midnight() {
+        let path = scratch_db("daytokens");
+        let conn = Connection::open(&path).unwrap();
+        let now = ms("2026-11-09T02:00:00Z");
+        // Yesterday evening: real volume, but not today's.
+        insert(
+            &conn,
+            ms("2026-11-08T23:30:00Z"),
+            "opencode-go",
+            "cat-jam-free",
+            true,
+        );
+        // Today, on an unpriced pool model: the dollar figures hide
+        // this volume, the token count must not.
+        insert(
+            &conn,
+            ms("2026-11-09T00:30:00Z"),
+            "opencode-go",
+            "cat-jam-free",
+            true,
+        );
+        insert(
+            &conn,
+            ms("2026-11-09T01:15:00Z"),
+            "opencode-go",
+            "cat-jam-free",
+            true,
+        );
+        drop(conn);
+        let usages = collect_usage(&path, config::GoTier::Go, now, None).expect("collect");
+        let _ = std::fs::remove_file(&path);
+        let cat = usages.iter().find(|u| u.name == "cat-jam-free").unwrap();
+        assert_eq!(cat.tokens_today, 2_000_000);
     }
 }

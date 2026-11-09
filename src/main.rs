@@ -653,7 +653,7 @@ impl UsageTray {
         if usages.is_empty() {
             return "\nNo Go usage in the last 30 days".to_string();
         }
-        match go::composite_5h_ratio(usages) {
+        let mut line = match go::composite_5h_ratio(usages) {
             Some(ratio) => {
                 let spent: f64 = usages.iter().map(|u| u.used_5h).sum();
                 let mut line = format!(
@@ -666,7 +666,15 @@ impl UsageTray {
                 line
             }
             None => "\nGo usage not priced (outside the published table)".to_string(),
+        };
+        let go_tokens_today: u64 = usages.iter().map(|u| u.tokens_today).sum();
+        if go_tokens_today > 0 {
+            line.push_str(&format!(
+                "\nGo tokens today: {}",
+                format_tokens(go_tokens_today)
+            ));
         }
+        line
     }
     /// The hover text: title lines plus the reset time. Shared with `--once`
     /// so the CLI and the tray can't drift apart.
@@ -808,6 +816,13 @@ impl UsageTray {
                                     "\nWeekly window: {:.0}% used · monthly window ({month_label}): {:.0}% used",
                                     week * 100.0,
                                     month * 100.0
+                                ));
+                            }
+                            let go_tokens_today: u64 = usages.iter().map(|u| u.tokens_today).sum();
+                            if go_tokens_today > 0 {
+                                s.push_str(&format!(
+                                    "\nGo tokens today: {}",
+                                    format_tokens(go_tokens_today)
                                 ));
                             }
                             for usage in usages {
@@ -1789,6 +1804,7 @@ mod tests {
             used_month: 30.0, // half the $60 monthly limit: context, not the light
             monthly_limit: Some(60.0),
             first_5h_ms: None,
+            tokens_today: 0,
         }]);
         assert!(t.level() == Level::Green);
         assert!(
@@ -1800,6 +1816,12 @@ mod tests {
         assert!(summary.contains("Go usage (estimated from token prices):"));
         assert!(summary.contains("5-hour window: 0% used · $0.00 spent"));
         assert!(summary.contains("Kimi K2.7 Code: $30.00 of $60.00 last 30 days"));
+        // No tokens today yet: no tokens line in either place.
+        assert!(!t.hover().title.contains("Go tokens today"));
+        assert!(!summary.contains("Go tokens today"));
+        t.go.as_mut().unwrap()[0].tokens_today = 230_000_000;
+        assert!(t.hover().title.contains("\nGo tokens today: 230.0M"));
+        assert!(t.summary().contains("Go tokens today: 230.0M"));
         t.go.as_mut().unwrap()[0].used_5h = 10.0; // 10 / 12 = 83% of the 5-hour window
         assert!(t.level() == Level::Yellow);
         t.go.as_mut().unwrap()[0].used_5h = 12.0; // the whole 5-hour window
@@ -1816,6 +1838,7 @@ mod tests {
             used_month,
             monthly_limit: Some(60.0),
             first_5h_ms: None,
+            tokens_today: 0,
         };
         // Neither model is at its own limit, but their shares add
         // past the whole window: capped.
