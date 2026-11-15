@@ -1025,6 +1025,11 @@ impl Metric {
             }
             Metric::Requests => (Style::default().green(), Style::default().white()),
             Metric::Cost => (Style::default().yellow(), Style::default().white()),
+            Metric::Input => (Style::default().blue(), Style::default().white()),
+            Metric::Output => (Style::default().green(), Style::default().white()),
+            Metric::Reasoning => (Style::default().magenta(), Style::default().white()),
+            Metric::CacheRead => (Style::default().cyan(), Style::default().white()),
+            Metric::CacheWrite => (Style::default().yellow(), Style::default().white()),
             _ => (Style::default().cyan(), Style::default().white()),
         }
     }
@@ -1249,7 +1254,7 @@ fn screen_width(terminal: &ratatui::DefaultTerminal) -> u16 {
 /// The five token kinds of one row, in chart order: short label and
 /// value. The labels stay short (In, Out, R, C/R, C/W) so a row's
 /// five bars stay narrow.
-fn token_kind_values(m: &Metrics) -> [(&'static str, u64); 5] {
+pub fn token_kind_values(m: &Metrics) -> [(&'static str, u64); 5] {
     [
         ("In", m.input),
         ("Out", m.output),
@@ -1262,7 +1267,7 @@ fn token_kind_values(m: &Metrics) -> [(&'static str, u64); 5] {
 /// One row's token kinds as bars for the token-kinds metric: a
 /// color per kind, and no value text, because at this width the
 /// counts would clip (the header carries the range total).
-fn token_kind_bars(m: &Metrics) -> Vec<Bar<'static>> {
+pub fn token_kind_bars(m: &Metrics) -> Vec<Bar<'static>> {
     let colors = [
         Style::default().blue(),
         Style::default().green(),
