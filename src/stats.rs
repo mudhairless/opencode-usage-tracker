@@ -6,8 +6,9 @@
 //! interactive terminal chart. The chart draws as many days as bars fit
 //! across the terminal — eight columns per bar with a one column gap — and
 //! `--days` overrides that count; when the report spans more days than fit,
-//! the arrow keys slide the window a day at a time. Bars are the default:
-//! `b` switches to a line, `Tab` switches between tokens and requests.
+//! the arrow keys slide the window a day at a time. `Tab` switches the
+//! metric: tokens, requests, cost, cache ratio, and a token-kinds
+//! breakdown that shows each row's tokens split into five buckets.
 //! `f` switches to a second screen: failed tool calls per day, counted
 //! from the tool parts in message data, with a per-tool breakdown.
 //!
@@ -23,21 +24,24 @@
 use std::io;
 use std::path::PathBuf;
 
-use crate::{
-    format_tokens, free_rows_between, is_free_model, now_ms, open_db, tokens_in, utc_day_start_ms,
-};
+use crate::{free_rows_between, is_free_model, now_ms, open_db, tokens_in, utc_day_start_ms};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::Alignment;
 use ratatui::style::Style;
-use ratatui::symbols;
-use ratatui::widgets::{Axis, Bar, BarChart, BarGroup, Chart, Dataset, GraphType};
+use ratatui::text::Line;
+use ratatui::widgets::{Bar, BarChart, BarGroup};
 
 const DAY_MS: i64 = 86_400_000;
 /// Columns one day's bar occupies, and the gap that separates it from the
 /// next. The day count that fills the screen falls out of these two.
 const BAR_WIDTH: u16 = 8;
 const BAR_GAP: u16 = 1;
+/// Columns one token-kind bar occupies in the token-kinds metric:
+/// wide enough for its longest label ("C/R"), and no wider.
+const KIND_BAR_WIDTH: u16 = 4;
+/// The gap between one row's group of kind bars and the next row's.
+const KIND_GROUP_GAP: u16 = 2;
 /// Days `--json` reports when `--days` is left off: no bars to fit.
 const JSON_DAYS: u32 = 7;
 
@@ -51,6 +55,16 @@ fn fit_days(width: u16) -> u32 {
 fn fit_count(width: u16, bar_width: u16) -> u32 {
     let per_day = bar_width + BAR_GAP;
     (width.saturating_add(BAR_GAP) / per_day).max(1).into()
+}
+
+/// How many token-kind groups fit across `width` columns: five bars
+/// and their inner gaps per group, plus the group gap after each
+/// group except the last.
+fn fit_groups(width: u16) -> u32 {
+    let per_group = 5 * KIND_BAR_WIDTH + 4 * BAR_GAP + KIND_GROUP_GAP;
+    (width.saturating_add(KIND_GROUP_GAP) / per_group)
+        .max(1)
+        .into()
 }
 
 /// One UTC day of free-tier usage.
@@ -935,6 +949,7 @@ pub fn run_query(path: &PathBuf, opts: &StatsOptions) -> anyhow::Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Metric {
     Tokens,
+    TokenKinds,
     Requests,
     Cost,
     CacheRatio,
@@ -949,6 +964,7 @@ impl Metric {
     fn name(self) -> &'static str {
         match self {
             Metric::Tokens => "tokens",
+            Metric::TokenKinds => "token-kinds",
             Metric::Requests => "requests",
             Metric::Cost => "cost",
             Metric::CacheRatio => "cache-ratio",
@@ -963,6 +979,7 @@ impl Metric {
     fn raw(self, m: &Metrics) -> f64 {
         match self {
             Metric::Tokens => m.tokens() as f64,
+            Metric::TokenKinds => m.tokens() as f64,
             Metric::Requests => m.requests as f64,
             Metric::Cost => m.cost,
             Metric::CacheRatio => m.cache_ratio().unwrap_or(0.0) * 100.0,
@@ -986,21 +1003,12 @@ impl Metric {
     /// The value as it prints on a bar or in the header.
     fn text(self, m: &Metrics) -> String {
         match self {
-            Metric::Tokens => format_precise_tokens(m.tokens()),
+            Metric::Tokens | Metric::TokenKinds => format_precise_tokens(m.tokens()),
             Metric::Cost => format!("${:.2}", m.cost),
             Metric::CacheRatio => m
                 .cache_ratio()
                 .map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0)),
             _ => format!("{}", self.raw(m) as u64),
-        }
-    }
-
-    fn y_label(self, v: f64) -> String {
-        match self {
-            Metric::Tokens => format_tokens(v as u64),
-            Metric::Cost => format!("${v:.2}"),
-            Metric::CacheRatio => format!("{v:.0}%"),
-            _ => format!("{v:.0}"),
         }
     }
 
@@ -1012,7 +1020,9 @@ impl Metric {
             // Calm blue rather than the glaring green. The value text
             // is bright white on every metric: it prints at the bar's
             // base, and the darker styles blended into the fill.
-            Metric::Tokens => (Style::default().blue(), Style::default().white()),
+            Metric::Tokens | Metric::TokenKinds => {
+                (Style::default().blue(), Style::default().white())
+            }
             Metric::Requests => (Style::default().green(), Style::default().white()),
             Metric::Cost => (Style::default().yellow(), Style::default().white()),
             _ => (Style::default().cyan(), Style::default().white()),
@@ -1021,15 +1031,17 @@ impl Metric {
 }
 
 /// The metrics a query puts on the chart's Tab cycle. The token
-/// buckets ride along with the tokens total rather than cycling
-/// individually; selected on their own, they cycle one by one. Cost
-/// is skipped for the free pool, whose rows are zero-cost by
-/// definition — an all-zero chart would say nothing.
+/// buckets ride along with the tokens total as one combined
+/// token-kinds breakdown rather than cycling individually; selected
+/// on their own, they cycle one by one. Cost is skipped for the
+/// free pool, whose rows are zero-cost by definition — an all-zero
+/// chart would say nothing.
 fn metrics_for(query: &Query) -> Vec<Metric> {
     let fields = &query.fields;
     let mut out = Vec::new();
     if fields.tokens {
         out.push(Metric::Tokens);
+        out.push(Metric::TokenKinds);
     }
     if fields.requests {
         out.push(Metric::Requests);
@@ -1083,11 +1095,34 @@ fn row_label(row: &ReportRow) -> String {
     }
 }
 
+/// A row's label as it prints under its bar. When the row names a
+/// model, the class word is dropped ("beam-free other" becomes
+/// "beam-free"). The class is not lost: it stays in the header's
+/// range line and in the --text/--json output. Only the axis slims
+/// down, so the bars stop stretching to fit the longest composite
+/// label.
+fn axis_label(row: &ReportRow) -> String {
+    let mut parts = Vec::new();
+    if let Some(date) = &row.date {
+        parts.push(date[5..].to_string());
+    }
+    if let Some(model) = &row.model {
+        parts.push(model.clone());
+    } else if let Some(category) = row.category {
+        parts.push(category.as_str().to_string());
+    }
+    if parts.is_empty() {
+        "total".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
 /// The bar width a report needs: the fixed width, or wide enough for
-/// the longest row label (model names are long), capped so one bar
+/// the longest axis label (model names are long), capped so one bar
 /// cannot eat the screen.
 fn bar_width_for(rows: &[ReportRow]) -> u16 {
-    let longest = rows.iter().map(|r| row_label(r).len()).max().unwrap_or(0) as u16;
+    let longest = rows.iter().map(|r| axis_label(r).len()).max().unwrap_or(0) as u16;
     longest.clamp(BAR_WIDTH, 24)
 }
 
@@ -1130,16 +1165,25 @@ fn chart_loop(
     let mut window_start = 0usize; // first visible row
     let mut fail_start = 0usize; // first visible day on the failures screen
     let mut metric_idx = 0usize;
-    let mut bars = true; // true bar chart, false line chart
     let mut screen = Screen::Usage;
     loop {
         // More rows loaded than fit on screen: show one screenful and
         // let the arrow keys slide it.
         let bar_width = bar_width_for(&report.rows);
-        let max_visible = report
-            .rows
-            .len()
-            .min(fit_count(screen_width(terminal), bar_width) as usize);
+        let metric = metrics[metric_idx % metrics.len()];
+        // The token-kinds metric fits five bars per row, so its
+        // screenful is counted in groups, not single bars.
+        let max_visible = if metric == Metric::TokenKinds {
+            report
+                .rows
+                .len()
+                .min(fit_groups(screen_width(terminal)) as usize)
+        } else {
+            report
+                .rows
+                .len()
+                .min(fit_count(screen_width(terminal), bar_width) as usize)
+        };
         window_start = window_start.min(report.rows.len().saturating_sub(max_visible));
         let fail_max_visible = failures
             .days
@@ -1148,23 +1192,13 @@ fn chart_loop(
         fail_start = fail_start.min(failures.days.len().saturating_sub(fail_max_visible));
         match screen {
             Screen::Usage => {
-                let metric = metrics[metric_idx % metrics.len()];
                 terminal.draw(|frame| {
-                    draw(
-                        frame,
-                        &report,
-                        window_start,
-                        max_visible,
-                        metric,
-                        bars,
-                        bar_width,
-                    )
+                    draw(frame, &report, window_start, max_visible, metric, bar_width)
                 })?;
             }
             Screen::Failures => {
-                terminal.draw(|frame| {
-                    draw_failures(frame, &failures, fail_start, fail_max_visible, bars)
-                })?;
+                terminal
+                    .draw(|frame| draw_failures(frame, &failures, fail_start, fail_max_visible))?;
             }
         }
         match event::read()? {
@@ -1201,7 +1235,6 @@ fn chart_loop(
                     }
                 },
                 KeyCode::Tab => metric_idx = (metric_idx + 1) % metrics.len(),
-                KeyCode::Char('b') => bars = !bars,
                 _ => {}
             },
             _ => {}
@@ -1213,13 +1246,48 @@ fn screen_width(terminal: &ratatui::DefaultTerminal) -> u16 {
     terminal.size().map_or(0, |size| size.width)
 }
 
+/// The five token kinds of one row, in chart order: short label and
+/// value. The labels stay short (In, Out, R, C/R, C/W) so a row's
+/// five bars stay narrow.
+fn token_kind_values(m: &Metrics) -> [(&'static str, u64); 5] {
+    [
+        ("In", m.input),
+        ("Out", m.output),
+        ("R", m.reasoning),
+        ("C/R", m.cache_read),
+        ("C/W", m.cache_write),
+    ]
+}
+
+/// One row's token kinds as bars for the token-kinds metric: a
+/// color per kind, and no value text, because at this width the
+/// counts would clip (the header carries the range total).
+fn token_kind_bars(m: &Metrics) -> Vec<Bar<'static>> {
+    let colors = [
+        Style::default().blue(),
+        Style::default().green(),
+        Style::default().magenta(),
+        Style::default().cyan(),
+        Style::default().yellow(),
+    ];
+    token_kind_values(m)
+        .iter()
+        .zip(colors)
+        .map(|((label, value), style)| {
+            Bar::new(*value)
+                .label(label.to_string())
+                .text_value(String::new())
+                .style(style)
+        })
+        .collect()
+}
+
 fn draw(
     frame: &mut Frame,
     report: &Report,
     window_start: usize,
     max_visible: usize,
     metric: Metric,
-    bars: bool,
     bar_width: u16,
 ) {
     let visible = &report.rows[window_start..window_start + max_visible];
@@ -1239,7 +1307,7 @@ fn draw(
     // the bars, never the total.
     let header = format!(
         "OpenCode usage   {span}\n\
-         {} {}   ←/→ slide window   Tab metric   b bars/line   f tool failures   q quit",
+         {} {}   ←/→ slide window   Tab metric   f tool failures   q quit",
         metric.text(&report.totals),
         metric.name(),
     );
@@ -1262,78 +1330,53 @@ fn draw(
         return;
     }
 
-    let labels: Vec<String> = visible.iter().map(row_label).collect();
-    // The bar chart has no dataset names of its own, so both chart styles
-    // pair a fill color with the name to label it with.
+    // The bar chart has no dataset name of its own, so the fill color
+    // pairs with the metric name to label it.
     let (color, value_style) = metric.styles();
     let name = metric.name();
 
-    if bars {
-        let columns: Vec<Bar> = visible
+    if metric == Metric::TokenKinds {
+        // One group per row: the row's five kinds side by side,
+        // the group labeled like any other chart row.
+        let kind_bars: Vec<Vec<Bar>> = visible
             .iter()
-            .map(|r| {
-                Bar::new(metric.bar_value(&r.metrics))
-                    .label(row_label(r))
-                    .text_value(metric.text(&r.metrics))
-                    .style(color)
+            .map(|r| token_kind_bars(&r.metrics))
+            .collect();
+        let groups: Vec<BarGroup> = visible
+            .iter()
+            .zip(&kind_bars)
+            .map(|(r, bars)| {
+                BarGroup::default()
+                    .label(Line::from(axis_label(r)))
+                    .bars(bars)
             })
             .collect();
-        render_bars(frame, chunks[1], &columns, value_style, bar_width);
-        // Same corner, same box as the line chart's legend.
+        render_grouped_bars(frame, chunks[1], groups, value_style);
         render_bar_legend(frame, chunks[1], name, color);
         return;
     }
 
-    let values: Vec<f64> = visible.iter().map(|r| metric.raw(&r.metrics)).collect();
-    let points: Vec<(f64, f64)> = values
+    let columns: Vec<Bar> = visible
         .iter()
-        .enumerate()
-        .map(|(i, v)| (i as f64, *v))
+        .map(|r| {
+            Bar::new(metric.bar_value(&r.metrics))
+                .label(axis_label(r))
+                .text_value(metric.text(&r.metrics))
+                .style(color)
+        })
         .collect();
-    let max = values
-        .iter()
-        .copied()
-        .reduce(f64::max)
-        .unwrap_or(1.0)
-        .max(1.0);
-    let min = values.iter().copied().reduce(f64::min).unwrap_or(0.0);
-    let y0 = if min == 0.0 { 0.0 } else { min * 0.85 };
-    let y1 = max * 1.15;
-    let dataset = Dataset::default()
-        .name(name)
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(color)
-        .data(&points);
-    frame.render_widget(
-        Chart::new(vec![dataset])
-            .x_axis(
-                Axis::default()
-                    .labels(labels.iter().map(|l| l.as_str()))
-                    .labels_alignment(Alignment::Center)
-                    .style(Style::default().dark_gray())
-                    .bounds([0.0, (values.len() - 1).max(1) as f64]),
-            )
-            .y_axis(
-                Axis::default()
-                    .style(Style::default().dark_gray())
-                    .labels(vec![metric.y_label(y0), metric.y_label(y1)])
-                    .bounds([y0, y1]),
-            ),
-        chunks[1],
-    );
+    render_bars(frame, chunks[1], &columns, value_style, bar_width);
+    render_bar_legend(frame, chunks[1], name, color);
 }
 
-/// The failures screen: failed tool calls per day as bars (or a
-/// line), with the per-tool breakdown under the chart. Days are
-/// zero-filled, so a clean day shows as an empty bar rather than
-/// vanishing.
+/// The failures screen: failed tool calls per day as bars, with the
+/// per-tool breakdown under the chart. Days are zero-filled, so a
+/// clean day shows as an empty bar rather than vanishing.
 fn draw_failures(
     frame: &mut Frame,
     failures: &ToolFailures,
     window_start: usize,
     max_visible: usize,
-    bars: bool,
 ) {
     let visible = &failures.days[window_start..window_start + max_visible];
     let span = if visible.len() > 1 {
@@ -1350,7 +1393,7 @@ fn draw_failures(
 
     let header = format!(
         "OpenCode tool failures   {span}\n\
-         {} failed in range   ←/→ slide window   b bars/line   f usage   q quit",
+         {} failed in range   ←/→ slide window   f usage   q quit",
         failures.total,
     );
 
@@ -1392,60 +1435,38 @@ fn draw_failures(
 
     let color = Style::default().red();
     let value_style = Style::default().white();
-    if bars {
-        let columns: Vec<Bar> = visible
-            .iter()
-            .map(|(day, count)| {
-                Bar::new(*count)
-                    .label(day[5..].to_string())
-                    .text_value(count.to_string())
-                    .style(color)
-            })
-            .collect();
-        render_bars(frame, chunks[1], &columns, value_style, BAR_WIDTH);
-        render_bar_legend(frame, chunks[1], "failed calls", color);
-        return;
-    }
+    let columns: Vec<Bar> = visible
+        .iter()
+        .map(|(day, count)| {
+            Bar::new(*count)
+                .label(day[5..].to_string())
+                .text_value(count.to_string())
+                .style(color)
+        })
+        .collect();
+    render_bars(frame, chunks[1], &columns, value_style, BAR_WIDTH);
+    render_bar_legend(frame, chunks[1], "failed calls", color);
+}
 
-    let values: Vec<f64> = visible.iter().map(|(_, count)| *count as f64).collect();
-    let points: Vec<(f64, f64)> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as f64, *v))
-        .collect();
-    let max = values
-        .iter()
-        .copied()
-        .reduce(f64::max)
-        .unwrap_or(1.0)
-        .max(1.0);
-    let labels: Vec<String> = visible
-        .iter()
-        .map(|(day, _)| day[5..].to_string())
-        .collect();
-    let dataset = Dataset::default()
-        .name("failed calls")
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(color)
-        .data(&points);
-    frame.render_widget(
-        Chart::new(vec![dataset])
-            .x_axis(
-                Axis::default()
-                    .labels(labels.iter().map(|l| l.as_str()))
-                    .labels_alignment(Alignment::Center)
-                    .style(Style::default().dark_gray())
-                    .bounds([0.0, (values.len() - 1).max(1) as f64]),
-            )
-            .y_axis(
-                Axis::default()
-                    .style(Style::default().dark_gray())
-                    .labels(vec![format!("{:.0}", 0.0), format!("{:.0}", max * 1.15)])
-                    .bounds([0.0, max * 1.15]),
-            ),
-        chunks[1],
-    );
+/// The grouped bar chart of the token-kinds metric: five narrow
+/// bars per row, groups separated wider than the bars inside them.
+/// `data` adds one group per call.
+fn render_grouped_bars(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    groups: Vec<BarGroup>,
+    value_style: Style,
+) {
+    let mut chart = BarChart::default()
+        .bar_width(KIND_BAR_WIDTH)
+        .bar_gap(BAR_GAP)
+        .group_gap(KIND_GROUP_GAP)
+        .value_style(value_style)
+        .label_style(Style::default().dark_gray());
+    for group in groups {
+        chart = chart.data(group);
+    }
+    frame.render_widget(chart, area);
 }
 
 /// The bar chart: the given bars at `bar_width`, separated by a single
@@ -1468,12 +1489,12 @@ fn render_bars(
     );
 }
 
-/// The line chart labels itself through its dataset names — a box whose border
-/// sits in the terminal's own color and whose text takes the dataset's. The
-/// bar chart gets the same box, in the same top-right corner. Both styles are
-/// spelled out rather than left to inherit: the box overlaps the bars, and
-/// inherited styles would let the fill color bleed into the border and text
-/// where they cross a bar while the rest stayed in the default color.
+/// The bar chart's legend: a box in the top-right corner whose border
+/// sits in the terminal's own color and whose text takes the bars'
+/// color. Both styles are spelled out rather than left to inherit:
+/// the box overlaps the bars, and inherited styles would let the fill
+/// color bleed into the border and text where they cross a bar while
+/// the rest stayed in the default color.
 fn render_bar_legend(frame: &mut Frame, area: ratatui::layout::Rect, name: &str, color: Style) {
     let width = (name.len() as u16 + 2).min(area.width);
     let rect = ratatui::layout::Rect {
@@ -1959,6 +1980,7 @@ mod tests {
             metrics_for(&q),
             vec![
                 Metric::Tokens,
+                Metric::TokenKinds,
                 Metric::Requests,
                 Metric::Cost,
                 Metric::CacheRatio
@@ -1968,16 +1990,21 @@ mod tests {
         assert_eq!(metrics_for(&q), vec![Metric::Cost]);
         q.fields = parse_fields("input").unwrap();
         assert_eq!(metrics_for(&q), vec![Metric::Input]);
-        // `tokens` selected: the buckets ride along with the total
-        // rather than cycling one by one.
+        // `tokens` selected: the buckets ride along as one combined
+        // breakdown rather than cycling one by one.
         q.fields = parse_fields("tokens").unwrap();
-        assert_eq!(metrics_for(&q), vec![Metric::Tokens]);
+        assert_eq!(metrics_for(&q), vec![Metric::Tokens, Metric::TokenKinds]);
         // The free pool is zero-cost by definition: no cost chart.
         q.fields = Fields::all();
         q.category = Some(Category::ZenFree);
         assert_eq!(
             metrics_for(&q),
-            vec![Metric::Tokens, Metric::Requests, Metric::CacheRatio]
+            vec![
+                Metric::Tokens,
+                Metric::TokenKinds,
+                Metric::Requests,
+                Metric::CacheRatio
+            ]
         );
     }
 
@@ -2026,6 +2053,65 @@ mod tests {
         // Bars widen to fit their labels, capped at 24 columns.
         assert_eq!(bar_width_for(std::slice::from_ref(&row)), 12);
         assert_eq!(fit_count(100, 17), 5);
+    }
+
+    #[test]
+    fn axis_label_drops_class_from_model_rows() {
+        let metrics = Metrics::default();
+        let model_row = ReportRow {
+            date: None,
+            model: Some("beam-free".to_string()),
+            category: Some(Category::Other),
+            metrics,
+        };
+        assert_eq!(axis_label(&model_row), "beam-free");
+        // The header label keeps the class.
+        assert_eq!(row_label(&model_row), "beam-free other");
+        let dated = ReportRow {
+            date: Some("2026-11-12".to_string()),
+            model: Some("beam-free".to_string()),
+            category: Some(Category::Other),
+            metrics,
+        };
+        assert_eq!(axis_label(&dated), "11-12 beam-free");
+        // A row with no model keeps its class on the axis too.
+        let class_only = ReportRow {
+            date: Some("2026-11-12".to_string()),
+            model: None,
+            category: Some(Category::ZenFree),
+            metrics,
+        };
+        assert_eq!(axis_label(&class_only), "11-12 zen-free");
+    }
+
+    #[test]
+    fn token_kind_bars_cover_the_row() {
+        let m = Metrics {
+            input: 100,
+            output: 50,
+            reasoning: 25,
+            cache_read: 20,
+            cache_write: 5,
+            ..Metrics::default()
+        };
+        let kinds = token_kind_values(&m);
+        assert_eq!(kinds.len(), 5);
+        // Every token of the row lands in exactly one bucket.
+        assert_eq!(kinds.iter().map(|(_, v)| *v).sum::<u64>(), m.tokens());
+        let labels: Vec<&str> = kinds.iter().map(|(label, _)| *label).collect();
+        assert_eq!(labels, vec!["In", "Out", "R", "C/R", "C/W"]);
+        assert_eq!(token_kind_bars(&m).len(), 5);
+    }
+
+    /// `fit_groups` decides how many rows of kind bars fill the
+    /// terminal: five 4-column bars, four inner gaps, and a group
+    /// gap per row, except after the last.
+    #[test]
+    fn fit_groups_counts_whole_groups() {
+        assert_eq!(fit_groups(0), 1); // never zero rows
+        assert_eq!(fit_groups(26), 1); // one group, with room to spare
+        assert_eq!(fit_groups(49), 1); // a second group would need 50
+        assert_eq!(fit_groups(50), 2);
     }
 
     /// `fit_days` decides how many bars fill the terminal: 8 columns each
